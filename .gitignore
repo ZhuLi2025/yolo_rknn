@@ -43,6 +43,10 @@ build/
 Build/
 build-*/
 
+# 转换后的 NPU 模型，体积大且和板子绑定
+models/*.rknn
+*.rknn
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
