@@ -54,6 +54,7 @@ struct YoloV8Detector::Impl {
     std::vector<std::vector<float>> host;
     bool pass_through = false;
     bool layout_warned = false;
+    std::vector<float> anchors;
 
     Impl() { std::memset(&input, 0, sizeof(input)); }
 };
@@ -108,8 +109,9 @@ Status YoloV8Detector::init() {
     }
     YR_LOGI("rknn input0 %s", shape_string(impl_->input).c_str());
     if (!input_matches(impl_->input, config_.model_width, config_.model_height)) {
-        return Status::Fail("model input shape does not match model_width x model_height x 3: " +
-                            shape_string(impl_->input));
+        return Status::Fail("model input shape does not match model_width x model_height (" +
+                            std::to_string(config_.model_width) + "x" + std::to_string(config_.model_height) +
+                            "): " + shape_string(impl_->input));
     }
     const uint32_t rgb_bytes =
         static_cast<uint32_t>(config_.model_width) * static_cast<uint32_t>(config_.model_height) * 3u;
@@ -130,6 +132,43 @@ Status YoloV8Detector::init() {
         impl_->outputs[i] = attr;
         impl_->host[i].assign(attr.n_elems, 0.f);
     }
+
+    if (config_.model_type == "yolov3") {
+        std::vector<RawTensor> shapes(impl_->outputs.size());
+        for (std::size_t i = 0; i < impl_->outputs.size(); ++i) {
+            const rknn_tensor_attr& attr = impl_->outputs[i];
+            shapes[i].channel_last = attr.fmt == RKNN_TENSOR_NHWC;
+            shapes[i].n_elems = attr.n_elems;
+            for (uint32_t d = 0; d < attr.n_dims; ++d) {
+                shapes[i].dims.push_back(static_cast<int>(attr.dims[d]));
+            }
+        }
+        if (!yolov3_outputs_recognized(shapes, config_.num_classes, config_.model_width, config_.model_height)) {
+            return Status::Fail("model_type=yolov3 but outputs are not darknet YOLOv3 heads (3 anchors, 5+classes)");
+        }
+        if (config_.anchors.empty()) {
+            // COCO 默认值，顺序是 stride 从大到小，每个 stride 三个 anchor。
+            if (impl_->outputs.size() == 2) {
+                const float tiny[] = {81.f, 82.f, 135.f, 169.f, 344.f, 319.f, 10.f, 14.f, 23.f, 27.f, 37.f, 58.f};
+                impl_->anchors.assign(tiny, tiny + 12);
+            } else if (impl_->outputs.size() == 3) {
+                const float full[] = {116.f, 90.f,  156.f, 198.f, 373.f, 326.f, 30.f, 61.f, 62.f, 45.f,
+                                      59.f,  119.f, 10.f,   13.f,  16.f,  30.f,  33.f, 23.f};
+                impl_->anchors.assign(full, full + 18);
+            } else {
+                return Status::Fail("yolov3 anchors are empty and this output count has no built-in default");
+            }
+            YR_LOGI("yolov3 using built-in COCO anchors for %zu heads", impl_->outputs.size());
+        } else {
+            impl_->anchors = config_.anchors;
+        }
+        if (impl_->anchors.size() != impl_->outputs.size() * 6) {
+            return Status::Fail("anchors has " + std::to_string(impl_->anchors.size() / 2) +
+                                " pairs, model has " + std::to_string(impl_->outputs.size()) +
+                                " heads, need 3 anchors per head");
+        }
+    }
+    YR_LOGI("model_type=%s", config_.model_type.c_str());
     return Status::Ok();
 }
 
@@ -198,15 +237,17 @@ Status YoloV8Detector::infer(const PreprocessResult& input, InferenceResult& res
     params.max_detections = config_.max_detections;
     params.anchor_scores_are_probabilities = config_.anchor_scores_are_probabilities;
     params.dfl_scores_are_logits = config_.dfl_scores_are_logits;
+    params.anchors = impl_->anchors;
     params.letterbox = input.meta;
-    const DecodeResult decoded = decode_yolov8(tensors, params);
+    const DecodeResult decoded =
+        config_.model_type == "yolov3" ? decode_yolov3(tensors, params) : decode_yolov8(tensors, params);
     rknn_outputs_release(impl_->ctx, static_cast<uint32_t>(fetched.size()), fetched.data());
 
     const auto t1 = std::chrono::steady_clock::now();
     result.infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (!decoded.layout_recognized) {
         if (!impl_->layout_warned) {
-            YR_LOGE("YOLO output layout is not the supported anchor head or 3-scale DFL head");
+            YR_LOGE("YOLO output layout does not match model_type=%s", config_.model_type.c_str());
             impl_->layout_warned = true;
         }
         return Status::Fail("unrecognized yolo output layout");

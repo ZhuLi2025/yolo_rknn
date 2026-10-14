@@ -7,6 +7,7 @@
 #include "yolo_rknn/common/status.hpp"
 
 #include <string>
+#include <vector>
 
 namespace yolo_rknn {
 
@@ -23,9 +24,14 @@ struct AppConfig {
     int analyze_duration_us = 100000;
 
     // ---- 模型 ----
+    // yolov8：单输出锚点头，或三个 DFL 头。yolov3：darknet 的多尺度 anchor 头，tiny 是 2 个，完整版是 3 个。
+    std::string model_type = "yolov8";
     std::string model_path;
     int model_width = 640;
     int model_height = 640;
+    // 仅 yolov3。每两个数是一个 anchor 的宽高，单位是模型输入像素。
+    // 按 stride 从大到小，每个 stride 三个 anchor。空则按输出头个数用 COCO 默认值。
+    std::vector<float> anchors;
     float conf_threshold = 0.25f;
     float nms_threshold = 0.45f;
     int num_classes = 80;

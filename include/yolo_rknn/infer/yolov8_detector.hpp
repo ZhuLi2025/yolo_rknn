@@ -1,6 +1,7 @@
 /**
  * @file yolov8_detector.hpp
  * @brief RKNN 1.7.5 推理封装。只在推理线程里创建和调用。
+ * model_type 决定后处理走 YOLOv8 还是 YOLOv3，加载和 rknn_run 是同一条路径。
  *
  * 本机 API 没有 “从 dma-buf fd 创建输入内存” 的接口，rknn_inputs_set 会把
  * 模型输入张量拷进片外 NPU。调用方应保证 rgb 已经是 RGA 产好的紧凑 RGB888。

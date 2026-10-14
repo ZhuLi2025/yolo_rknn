@@ -156,6 +156,52 @@ void test_unknown_layout() {
     expect(!result.layout_recognized, "unknown layout rejected");
 }
 
+void test_yolov3_head() {
+    constexpr int kClasses = 1;
+    constexpr int kChannels = 18;
+    constexpr int kGrid = 2;
+    std::vector<float> data(static_cast<std::size_t>(kChannels * kGrid * kGrid), -8.f);
+    auto at = [&](int c, int y, int x) -> float& {
+        return data[static_cast<std::size_t>((c * kGrid + y) * kGrid + x)];
+    };
+    at(0, 1, 1) = 0.f;
+    at(1, 1, 1) = 0.f;
+    at(2, 1, 1) = 0.f;
+    at(3, 1, 1) = 0.f;
+    at(4, 1, 1) = 8.f;
+    at(5, 1, 1) = 8.f;
+
+    yolo_rknn::RawTensor tensor;
+    tensor.dims.push_back(kGrid);
+    tensor.dims.push_back(kGrid);
+    tensor.dims.push_back(kChannels);
+    tensor.dims.push_back(1);
+    tensor.channel_last = false;
+    tensor.data = data.data();
+    tensor.n_elems = data.size();
+
+    yolo_rknn::DecodeParams params;
+    params.num_classes = kClasses;
+    params.conf_threshold = 0.25f;
+    params.nms_threshold = 0.45f;
+    params.max_detections = 10;
+    params.anchors = {10.f, 10.f, 20.f, 20.f, 30.f, 30.f};
+    params.letterbox = identity_box(32);
+
+    const yolo_rknn::DecodeResult result =
+        yolo_rknn::decode_yolov3(std::vector<yolo_rknn::RawTensor>(1, tensor), params);
+    expect(result.layout_recognized, "yolov3 layout");
+    expect(result.detections.size() == 1, "one yolov3 box");
+    if (!result.detections.empty()) {
+        // sigmoid(0)=0.5，中心 (0.5+1)*16=24，anchor 10，左上角 19。
+        expect_near(result.detections[0].x, 19.f, 0.2f, "yolov3 x");
+        expect_near(result.detections[0].y, 19.f, 0.2f, "yolov3 y");
+        expect_near(result.detections[0].w, 10.f, 0.2f, "yolov3 w");
+        expect_near(result.detections[0].h, 10.f, 0.2f, "yolov3 h");
+        expect(result.detections[0].score > 0.9f, "yolov3 score");
+    }
+}
+
 void test_zoom() {
     yolo_rknn::ZoomInput in;
     in.has_target = false;
@@ -217,6 +263,7 @@ int main() {
     test_anchor_nms();
     test_dfl();
     test_unknown_layout();
+    test_yolov3_head();
     test_zoom();
     test_osd_stroke();
     if (g_failed != 0) {

@@ -272,6 +272,122 @@ bool decode_dfl_head(const RawTensor& tensor, const DecodeParams& params, std::v
     return true;
 }
 
+struct YoloV3Head {
+    int grid_w = 0;
+    int grid_h = 0;
+    int channels = 0;
+    int anchor_count = 0;
+    int stride = 0;
+    bool nchw = true;
+    int order = 0;
+};
+
+bool view_yolov3_head(const RawTensor& tensor, int num_classes, int model_w, int model_h, YoloV3Head* head) {
+    const int per = 5 + num_classes;
+    if (per <= 5 || tensor.dims.size() != 4 || model_w <= 0 || model_h <= 0) {
+        return false;
+    }
+    auto channels_ok = [&](int channels) {
+        return channels > 0 && channels % per == 0 && channels / per >= 1 && channels / per <= 5;
+    };
+    int grid_w = 0;
+    int grid_h = 0;
+    int channels = 0;
+    bool nchw = true;
+    if (!tensor.channel_last && tensor.dims[0] == 1 && channels_ok(tensor.dims[1])) {
+        channels = tensor.dims[1];
+        grid_h = tensor.dims[2];
+        grid_w = tensor.dims[3];
+        nchw = true;
+    } else if (tensor.channel_last && tensor.dims[0] == 1 && channels_ok(tensor.dims[3])) {
+        grid_h = tensor.dims[1];
+        grid_w = tensor.dims[2];
+        channels = tensor.dims[3];
+        nchw = false;
+    } else if (!tensor.channel_last && tensor.dims[3] == 1 && channels_ok(tensor.dims[2])) {
+        // Toolkit 1.x 查询到的 dims 是倒序：[W, H, C, N]，内存仍是 NCHW 平面。
+        grid_w = tensor.dims[0];
+        grid_h = tensor.dims[1];
+        channels = tensor.dims[2];
+        nchw = true;
+    } else {
+        return false;
+    }
+    if (grid_w < 1 || grid_h < 1 || model_w % grid_w != 0 || model_h % grid_h != 0) {
+        return false;
+    }
+    if (model_w / grid_w != model_h / grid_h) {
+        return false;
+    }
+    const int cells = grid_w * grid_h * channels;
+    if (tensor.n_elems != 0 && static_cast<int>(tensor.n_elems) < cells) {
+        return false;
+    }
+    head->grid_w = grid_w;
+    head->grid_h = grid_h;
+    head->channels = channels;
+    head->anchor_count = channels / per;
+    head->stride = model_w / grid_w;
+    head->nchw = nchw;
+    return true;
+}
+
+float yolov3_at(const float* data, const YoloV3Head& head, int channel, int y, int x) {
+    if (head.nchw) {
+        return data[(channel * head.grid_h + y) * head.grid_w + x];
+    }
+    return data[(y * head.grid_w + x) * head.channels + channel];
+}
+
+void decode_yolov3_head(const RawTensor& tensor, const YoloV3Head& head, const float* anchor_wh,
+                        const DecodeParams& params, std::vector<Detection>* dets) {
+    if (tensor.data == nullptr) {
+        return;
+    }
+    const int per = 5 + params.num_classes;
+    const float stride = static_cast<float>(head.stride);
+    for (int a = 0; a < head.anchor_count; ++a) {
+        const float anchor_w = anchor_wh[a * 2];
+        const float anchor_h = anchor_wh[a * 2 + 1];
+        const int base = a * per;
+        for (int y = 0; y < head.grid_h; ++y) {
+            for (int x = 0; x < head.grid_w; ++x) {
+                const float objectness = sigmoid(yolov3_at(tensor.data, head, base + 4, y, x));
+                if (objectness < params.conf_threshold) {
+                    continue;
+                }
+                float best = 0.f;
+                int best_id = -1;
+                for (int c = 0; c < params.num_classes; ++c) {
+                    const float score = objectness * sigmoid(yolov3_at(tensor.data, head, base + 5 + c, y, x));
+                    if (score > best) {
+                        best = score;
+                        best_id = c;
+                    }
+                }
+                if (best < params.conf_threshold || best_id < 0) {
+                    continue;
+                }
+                const float tx = sigmoid(yolov3_at(tensor.data, head, base + 0, y, x));
+                const float ty = sigmoid(yolov3_at(tensor.data, head, base + 1, y, x));
+                const float tw = clampf(yolov3_at(tensor.data, head, base + 2, y, x), -16.f, 16.f);
+                const float th = clampf(yolov3_at(tensor.data, head, base + 3, y, x), -16.f, 16.f);
+                const float cx = (tx + static_cast<float>(x)) * stride;
+                const float cy = (ty + static_cast<float>(y)) * stride;
+                const float bw = std::exp(tw) * anchor_w;
+                const float bh = std::exp(th) * anchor_h;
+                Detection det;
+                det.score = best;
+                det.class_id = best_id;
+                map_box(cx - bw * 0.5f, cy - bh * 0.5f, cx + bw * 0.5f, cy + bh * 0.5f, params.letterbox, &det);
+                if (det.w >= 1.f && det.h >= 1.f) {
+                    dets->push_back(det);
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
 
 const char* coco_name(int class_id) {
@@ -323,6 +439,49 @@ DecodeResult decode_yolov8(const std::vector<RawTensor>& tensors, const DecodePa
         result.layout_recognized = true;
     } else {
         return result;
+    }
+    result.detections = nms(std::move(dets), params.nms_threshold, params.max_detections);
+    return result;
+}
+
+bool yolov3_outputs_recognized(const std::vector<RawTensor>& tensors, int num_classes, int model_width,
+                               int model_height) {
+    if (tensors.size() < 2 || tensors.size() > 3) {
+        return false;
+    }
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        YoloV3Head head;
+        if (!view_yolov3_head(tensors[i], num_classes, model_width, model_height, &head)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+DecodeResult decode_yolov3(const std::vector<RawTensor>& tensors, const DecodeParams& params) {
+    DecodeResult result;
+    if (params.anchors.size() != tensors.size() * 6) {
+        return result;
+    }
+    std::vector<YoloV3Head> heads(tensors.size());
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (!view_yolov3_head(tensors[i], params.num_classes, params.letterbox.model_width,
+                              params.letterbox.model_height, &heads[i])) {
+            return result;
+        }
+        heads[i].order = static_cast<int>(i);
+    }
+    std::sort(heads.begin(), heads.end(), [](const YoloV3Head& a, const YoloV3Head& b) {
+        if (a.stride != b.stride) {
+            return a.stride > b.stride;
+        }
+        return a.order < b.order;
+    });
+    result.layout_recognized = true;
+    std::vector<Detection> dets;
+    for (std::size_t i = 0; i < heads.size(); ++i) {
+        const float* anchor_wh = params.anchors.data() + i * 6;
+        decode_yolov3_head(tensors[static_cast<std::size_t>(heads[i].order)], heads[i], anchor_wh, params, &dets);
     }
     result.detections = nms(std::move(dets), params.nms_threshold, params.max_detections);
     return result;

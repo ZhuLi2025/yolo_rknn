@@ -22,6 +22,30 @@ std::string trim(const std::string& text) {
     return text.substr(begin, end - begin);
 }
 
+bool parse_float(const std::string& text, float* out);
+
+bool parse_anchors(const std::string& text, std::vector<float>* out) {
+    out->clear();
+    if (text.empty()) {
+        return true;
+    }
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = trim(item);
+        if (item.empty()) {
+            return false;
+        }
+        float value = 0.f;
+        if (!parse_float(item, &value) || value <= 0.f) {
+            return false;
+        }
+        out->push_back(value);
+    }
+    // 每个检测头 3 个 anchor，每个 anchor 两个数。
+    return !out->empty() && (out->size() % 6) == 0;
+}
+
 bool parse_bool(const std::string& text, bool* out) {
     if (text == "1" || text == "true" || text == "yes" || text == "on") {
         *out = true;
@@ -79,8 +103,13 @@ Status assign(AppConfig* cfg, const std::string& key, const std::string& value, 
         if (!parse_int(value, &cfg->probe_size)) return bad("expect int");
     } else if (key == "analyze_duration_us") {
         if (!parse_int(value, &cfg->analyze_duration_us)) return bad("expect int");
+    } else if (key == "model_type") {
+        if (value != "yolov8" && value != "yolov3") return bad("expect yolov8 or yolov3");
+        cfg->model_type = value;
     } else if (key == "model_path") {
         cfg->model_path = value;
+    } else if (key == "anchors") {
+        if (!parse_anchors(value, &cfg->anchors)) return bad("expect 6*N positive floats, 3 anchors per head");
     } else if (key == "model_width") {
         if (!parse_int(value, &cfg->model_width)) return bad("expect int");
     } else if (key == "model_height") {
@@ -207,8 +236,14 @@ Status AppConfig::validate() const {
     if (max_delay_us < 0 || buffer_size < 4096 || stimeout_us < 0) {
         return Status::Fail("max_delay_us / buffer_size / stimeout_us out of range");
     }
+    if (model_type != "yolov8" && model_type != "yolov3") {
+        return Status::Fail("model_type must be yolov8 or yolov3");
+    }
     if (!decode_only && model_path.empty()) {
         return Status::Fail("model_path is empty (or set decode_only=true)");
+    }
+    if (model_type == "yolov3" && !anchors.empty() && (anchors.size() % 6) != 0) {
+        return Status::Fail("anchors must list 3 per head, each as width,height");
     }
     if (model_width < 2 || model_height < 2 || (model_width & 1) || (model_height & 1)) {
         return Status::Fail("model_width and model_height must be positive even numbers");
