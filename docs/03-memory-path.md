@@ -48,13 +48,13 @@ H.264 / H.265 以外的编码直接失败，没有软解分支。MP4 里的 AVCC
 MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CONTIG
 ```
 
-这是本机的物理连续内存。MPP 日志里会写 `found drm allocator`（没有 ION）。海思文档里的 MMZ 就是同一类东西：给硬件用的、物理地址连续的专用内存。这里不使用 `MPP_BUFFER_TYPE_NORMAL`，那种缓冲来自普通 malloc，RGA 不能用 dma-buf fd 导入。
+申请失败时再试 `MPP_BUFFER_TYPE_DMA_HEAP | MPP_BUFFER_FLAGS_CONTIG`。当前用户对 `/dev/dma_heap` 没有写权限，实测走的是 DRM CMA。这里不使用 `MPP_BUFFER_TYPE_NORMAL`，那种缓冲来自普通 malloc，RGA 不能用 dma-buf fd 导入。
 
 group 限制为 `decoder_buf_count`（默认 12）张，尺寸是 VPU 报上来的 `buf_size`。1080p 实测是 1920x1080，stride 1920x1088，一张约 4 MiB。
 
-帧交给下游时只带 dma-buf fd、宽高和 stride。`MppFrame` 被 `shared_ptr` 握住，析构时 `mpp_frame_deinit`，buffer 才回到 VPU 的 pool。推理线程在 `c_RkRgaBlit` 返回之后立刻丢掉这个 `shared_ptr`，不等 NPU 跑完。RGA 的 ioctl 是同步的，返回时缩放结果已经在目标缓冲里。
+帧交给下游时只带 dma-buf fd、宽高和 stride。`MppFrame` 被 `shared_ptr` 握住，析构时 `mpp_frame_deinit`，buffer 才回到 VPU 的 pool。推理线程在 `improcess` 返回之后立刻丢掉这个 `shared_ptr`，不等 NPU 跑完。RGA 的 ioctl 带 `IM_SYNC`，返回时缩放结果已经在目标缓冲里。
 
-输出格式不是 NV12（例如 10bit）就丢帧。本机 RGA 和后面的 uint8 模型都按 8bit NV12 写。不要在这里加一条 CPU 转换。
+输出格式不是线性 NV12（例如 10bit 或 AFBC）就丢帧。RK3588 的 RGA 和后面的 uint8 模型都按 8bit NV12 写。不要在这里加一条 CPU 转换。
 
 文件结束时 `flush()` 送一个 EOS 空包，把还留在重排序里的帧取出来。直播中途不调用 `mpi->reset()`：推理线程可能还拿着上一帧的 fd。
 
@@ -62,32 +62,37 @@ group 限制为 `decoder_buf_count`（默认 12）张，尺寸是 VPU 报上来�
 
 ## RGA 预处理
 
-目标是一块单独的 DRM 缓冲，大小为 `model_width * model_height * 3`，优先 `CONTIG | CACHABLE`。申请不到 cacheable 时退回只要求物理连续，并打警告。
+目标是一块单独的物理连续缓冲，大小为 `model_width * model_height * 3`。分配顺序是 DRM CMA、dma-heap CMA，然后才是这两种的 cacheable 版本。非 cacheable 时 RGA 写完，NPU 可以直接读，中间不做 CPU cache 同步。
 
 每一帧：
 
-1. `c_RkRgaColorFill` 把目标涂成 114 灰（`0x00727272`），和常见 YOLO letterbox 的填充值一致
-2. `c_RkRgaBlit` 把 NV12 按短边缩放到目标中央，坐标和宽高都对齐到偶数。源的 `wstride/hstride` 用 MPP 的 hor/ver stride，不是有效宽高
-3. `DMA_BUF_IOCTL_SYNC` 以 `DMA_BUF_SYNC_READ | START` 作废 CPU cache
+1. `imfill` 把目标涂成 114 灰（`0x727272`），和常见 YOLO letterbox 的填充值一致
+2. `improcess` 把 NV12 按短边缩放到目标中央，坐标和宽高都对齐到偶数。源的宽高 stride 用 MPP 的 hor/ver stride，不是有效宽高
+3. 只有缓冲是 cacheable 时，才用 `DMA_BUF_IOCTL_SYNC` 作废 CPU cache
 
-第 3 步是因为 RGA 通过 DMA 写内存。buffer 如果是 cacheable 的，CPU 随后读到的可能还是旧 cache。`rknn_inputs_set` 会从用户态指针把这张 RGB 拷进 NPU，拷贝之前必须看到新数据。
+librga 自己在 RGA2 和 RGA3 之间选核。模型宽高必须是 16 的倍数，否则 RGA3 会拒绝这张 RGB888。失败时返回错误字符串，调用方丢帧。没有第二套实现。
 
-`finish_cpu_read()` 在 `rknn_inputs_set` 返回后调用，结束这次 CPU 读同步。指针在下一次 `process()` 之前有效，预处理类不是线程安全的，只允许推理线程使用。
+`finish_cpu_read()` 在推理返回后调用。非 cacheable 时它是空操作。预处理类不是线程安全的，只允许推理线程使用。显示线程清 OSD 时走同一把 `RgaApiLock`。
 
 letterbox 的 `scale`、`pad_x`、`pad_y` 交给后处理，把模型坐标系的框映射回原图。缩放比用对齐之后的整数宽除以源宽，避免偶数对齐带来的半个像素误差。
 
-源 fd 和目标 fd 都设 `mmuFlag = 1`，这是 RK3399 上 dma-buf 导入 RGA 的用法。失败时返回错误码，调用方丢帧。没有第二套实现。
+## 输入怎么进 NPU
 
-## 仍然会发生的那一次拷贝
+推理线程在两块硬件都初始化之后调用 `bind_input()`：
 
-RKNN API 1.7.5 的输入接口是 `rknn_inputs_set(void* buf)`。RK3399Pro 的 NPU 是片外协处理器，驱动必须把输入张量送过去。640x640 RGB 大约 1.2 MiB。
+1. `rknn_create_mem_from_fd` 导入 RGA 目标缓冲的 fd
+2. 输入已经是 uint8 NHWC、并且没有额外 stride 时，`pass_through=1`
+3. 否则 `pass_through=0`，类型和格式写成 uint8 NHWC，由驱动做布局转换
+4. `rknn_set_io_mem` 成功后，每帧只调用 `rknn_run`
 
-全分辨率 NV12（1080p 约 3 MiB，4K 更大）不经过 CPU。被禁止的是用 CPU 搬运和转换这一档数据。模型输入这一档拷贝是这套 API 和这颗 NPU 的边界，不是漏做的优化。RV1126 片内 NPU 加上 RKNN2 的 fd 输入才能把这一档也去掉，接口见 [对照说明](06-this-board-vs-rv1126.md)。
+导入失败时退回 `rknn_inputs_set`。640x640 RGB 大约 1.2 MiB，这一次拷贝只出现在退回路径上。全分辨率 NV12 仍然不经过 CPU。
+
+输出仍用 `rknn_outputs_get(want_float=1)`。后处理要的是 float，反量化留在驱动里。
 
 ## 显示
 
 `display_enable=true` 时，同一张 NV12 再进显示队列。`DrmDisplay` 用 `drmPrimeFDToHandle` + `drmModeAddFB2` 把 VPU 的 dma-buf 挂到视频平面，显示控制器自己扫描，CPU 不读这张图。当前帧和上一帧的 framebuffer 都留着，再往前的一张才 `RmFB` 并丢掉 `DecodedFrame`，避免扫描还没结束 buffer 已经被 VPU 覆写。
 
-OSD 是另一块 dumb buffer，格式 ARGB8888。每帧先 `c_RkRgaColorFill` 涂成全透明，再 `DMA_BUF_IOCTL_SYNC` 让 CPU 只描边和写字。框的内部保持透明，所以下面的 NV12 直接透出来。两层 `SetPlane` 用同一个目标矩形做 letterbox，检测框已经是原图像素坐标，和视频对得上。
+OSD 是另一块 dumb buffer，格式 ARGB8888。每帧先 `imfill` 涂成全透明，再 `DMA_BUF_IOCTL_SYNC` 让 CPU 只描边和写字。框的内部保持透明，所以下面的 NV12 直接透出来。两层 `SetPlane` 用同一个目标矩形做 letterbox，检测框已经是原图像素坐标，和视频对得上。
 
-本机探测时 HDMI-A-1 是断开的（`connection=2`，没有 mode）。没接显示器就打开显示，`init()` 会失败并让整个 pipeline 退出，日志里有 `HDMI-A-1 is unplugged`。
+本机探测时 HDMI-A-1、HDMI-A-2、DP-1 都是断开的。没接显示器就打开显示，`init()` 会失败并让整个 pipeline 退出。显示必须打开 `/dev/dri/card0`。`card1` 是 NPU。

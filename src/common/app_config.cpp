@@ -108,6 +108,8 @@ Status assign(AppConfig* cfg, const std::string& key, const std::string& value, 
         cfg->model_type = value;
     } else if (key == "model_path") {
         cfg->model_path = value;
+    } else if (key == "npu_cores") {
+        cfg->npu_cores = value;
     } else if (key == "anchors") {
         if (!parse_anchors(value, &cfg->anchors)) return bad("expect 6*N positive floats, 3 anchors per head");
     } else if (key == "model_width") {
@@ -239,14 +241,19 @@ Status AppConfig::validate() const {
     if (model_type != "yolov8" && model_type != "yolov3") {
         return Status::Fail("model_type must be yolov8 or yolov3");
     }
+    if (npu_cores != "auto" && npu_cores != "0" && npu_cores != "1" && npu_cores != "2" && npu_cores != "0_1" &&
+        npu_cores != "0_1_2") {
+        return Status::Fail("npu_cores must be auto, 0, 1, 2, 0_1 or 0_1_2");
+    }
     if (!decode_only && model_path.empty()) {
         return Status::Fail("model_path is empty (or set decode_only=true)");
     }
     if (model_type == "yolov3" && !anchors.empty() && (anchors.size() % 6) != 0) {
         return Status::Fail("anchors must list 3 per head, each as width,height");
     }
-    if (model_width < 2 || model_height < 2 || (model_width & 1) || (model_height & 1)) {
-        return Status::Fail("model_width and model_height must be positive even numbers");
+    // RK3588 的 RGA3 要求宽高 16 对齐，RGB888 的字节跨度才能被硬件接受。
+    if (model_width < 16 || model_height < 16 || (model_width % 16) != 0 || (model_height % 16) != 0) {
+        return Status::Fail("model_width and model_height must be positive multiples of 16");
     }
     if (num_classes <= 0 || max_detections <= 0 || queue_depth < 1 || decoder_buf_count < 4) {
         return Status::Fail("num_classes, max_detections, queue_depth or decoder_buf_count is invalid");

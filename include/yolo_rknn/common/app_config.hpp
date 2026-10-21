@@ -27,6 +27,8 @@ struct AppConfig {
     // yolov8：单输出锚点头，或三个 DFL 头。yolov3：darknet 的多尺度 anchor 头，tiny 是 2 个，完整版是 3 个。
     std::string model_type = "yolov8";
     std::string model_path;
+    // RK3588 三核 NPU。取值 auto / 0 / 1 / 2 / 0_1 / 0_1_2。
+    std::string npu_cores = "0_1_2";
     int model_width = 640;
     int model_height = 640;
     // 仅 yolov3。每两个数是一个 anchor 的宽高，单位是模型输入像素。
@@ -43,9 +45,10 @@ struct AppConfig {
 
     // ---- 线程 ----
     int queue_depth = 2;
-    int stream_cpu = 4;                 // A72
-    int infer_cpu = 5;                  // A72，只负责把张量送进 NPU
-    int business_cpu = 0;               // A53
+    // 拉流和推理分在两个 A76 簇上，避免抢同一块 L2。业务和显示放在 A55。
+    int stream_cpu = 6;                 // A76，2.4 GHz
+    int infer_cpu = 4;                  // A76，2.35 GHz
+    int business_cpu = 0;               // A55
     int stream_priority = 50;
     int infer_priority = 30;
     int business_priority = 20;

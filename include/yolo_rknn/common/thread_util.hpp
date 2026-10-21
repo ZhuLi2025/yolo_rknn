@@ -2,9 +2,10 @@
  * @file thread_util.hpp
  * @brief 给工作线程命名、绑核、提升调度优先级。
  *
- * RK3399Pro 的拓扑（本机）：
- *   cpu0–cpu3  Cortex-A53
- *   cpu4–cpu5  Cortex-A72
+ * RK3588 的拓扑（本机）：
+ *   cpu0–cpu3  Cortex-A55，1.8 GHz
+ *   cpu4–cpu5  Cortex-A76，2.35 GHz
+ *   cpu6–cpu7  Cortex-A76，2.4 GHz
  * 绑核本身通常不需要 root；SCHED_FIFO 需要 CAP_SYS_NICE。失败只告警，不让进程退出。
  */
 #pragma once

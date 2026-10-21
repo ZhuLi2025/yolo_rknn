@@ -29,8 +29,8 @@ MppDecoder 硬解
 | --- | --- | --- |
 | `RtspClient` | `av_read_frame`，bitstream filter 转 Annex-B | `avcodec_open2`，把像素解出来 |
 | `MppDecoder` | `mpp_create` / `decode_put_packet` / `decode_get_frame` | 软解，把 NV12 拷到普通堆内存 |
-| `RgaPreprocessor` | `c_RkRgaBlit`，fd 对 fd | `libswscale`，CPU resize，CPU `cvtColor` |
-| `YoloV8Detector` | `rknn_inputs_set` / `rknn_run` | 自己遍历 NV12 |
+| `RgaPreprocessor` | im2d 的 `imfill` / `improcess`，fd 对 fd | `libswscale`，CPU resize，CPU `cvtColor` |
+| `YoloV8Detector` | `rknn_set_io_mem` / `rknn_run`，失败时退回 `rknn_inputs_set` | 自己遍历 NV12 |
 | `decode_yolov8` / `decode_yolov3` | 按 `model_type` 对模型输出做解码和 NMS | 接触图像 |
 | `Controller` | 读高度、算变焦、写 VISCA | 碰解码器和 NPU |
 | `DrmDisplay` | 视频层 `drmModeSetPlane` 扫 NV12，OSD 层画框 | CPU 清整帧、CPU 做 NV12 转 RGB |

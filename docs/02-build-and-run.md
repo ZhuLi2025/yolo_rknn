@@ -6,17 +6,15 @@
 
 | 组件 | 版本或路径 |
 | --- | --- |
-| 板子 | RK3399pro-firefly-aiojd4，内核 4.4.194，6 核 |
-| 编译器 | g++ 7.5.0，C++14 |
-| CMake | 3.10.2。没有 `-S`/`-B`，`cmake --build . -j` 也不被接受，并行参数要写在 `--` 后面 |
-| FFmpeg | libavformat 58.20.100，装在 `/usr/local` |
-| MPP | `librockchip_mpp.so`，头文件 `/usr/include/rockchip` |
-| RGA | `/usr/lib/librga.so`，运行时报告 RGA 3.02 |
-| RKNN | API 1.7.5。Linux 库在 `/home/firefly/NPU/RK3399Pro_npu/rknn-api/librknn_api/Linux/lib64/librknn_api.so` |
+| 板子 | SuperString RK3588 RB1005，内核 5.10.160，8 核 |
+| 编译器 | g++ 9.4.0，C++14 |
+| CMake | 3.16.3 |
+| FFmpeg | libavformat 58.45.100，装在 `/usr/lib/aarch64-linux-gnu` |
+| MPP | `librockchip_mpp.so`，头文件 `/usr/include/rockchip`，包版本 20230628 |
+| RGA | `librga.so` 2.2.0，头文件 `/usr/include/rga`。运行时报告 RGA2 和 RGA3，API v1.9.2 |
+| RKNN | Runtime 2，`/usr/lib/librknnrt.so` 1.5.2，头文件 `/usr/include/rknn_api.h` |
 
-`/usr/local/lib/librknn_api.so` 是 Android 构建，依赖 `liblog.so`，符号版本是 `LIBC`。CMake 会跳过它，并给可执行文件加上 Linux 库目录的 rpath。换机器时如果路径不同，改 `CMakeLists.txt` 里的 `YR_RKNN_CANDIDATES`。
-
-用户 `firefly` 在 `video` 组里，能够打开 `/dev/vpu_service`、`/dev/rga` 和 `/dev/dri/renderD128`。不在这个组里时，硬解和 RGA 会在分配 DRM buffer 时失败。
+用户 `ubuntu` 对 `/dev/dri/card0`、`renderD128`、`renderD129` 有 ACL，能够打开显示节点和 NPU。`/dev/mpp_service` 和 `/dev/rga` 对其他用户也可写。`/dev/dma_heap/*` 只给 `video` 组写，当前用户不在这个组里，所以缓冲分配走 DRM CMA。把用户加进 `video` 组之后，dma-heap 那条后备路径才会成功。
 
 ## 编译
 
@@ -34,7 +32,7 @@
 ```bash
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -- -j$(nproc)
+cmake --build . -j$(nproc)
 ```
 
 工程有意不链接 `libswscale`。
@@ -45,7 +43,7 @@ cmake --build . -- -j$(nproc)
 
 ```bash
 # 只验证拉流、VPU、RGA
-./build/bin/yolo_rknn --url /usr/local/test.mp4 --decode-only
+./build/bin/yolo_rknn --url testdata/sample_1080p.mp4 --decode-only
 
 # RTSP。传输协议默认 tcp，max_delay 和 buffer_size 来自配置
 ./build/bin/yolo_rknn --url rtsp://192.168.1.64/live --model models/yolov8n.rknn
@@ -78,7 +76,7 @@ NV12 DRM buffers 1920x1080 stride 1920x1088 size=4177920 count=12
 seq=... det=0 height=10.00m preprocess=4.7ms infer=0.0ms
 ```
 
-`preprocess` 是 RGA 的耗时。`infer` 在 `--decode-only` 下是 0。加载模型之后，`infer` 是 `rknn_inputs_set` 到 `rknn_outputs_get` 的时间，里面包含驱动把输入张量送进片外 NPU 的拷贝。
+`preprocess` 是 RGA 的耗时。`infer` 在 `--decode-only` 下是 0。加载模型之后，`infer` 是 `rknn_run` 到 `rknn_outputs_get` 的时间。输入走 fd 时，这段时间里没有把 640x640 RGB 从用户态再拷一遍。退回 `rknn_inputs_set` 时，拷贝算在 `infer` 里。
 
 ## 调度优先级
 

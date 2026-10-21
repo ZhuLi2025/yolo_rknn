@@ -133,14 +133,26 @@ Status MppDecoder::ensure_buffer_group(void* frame_ptr) {
         impl_->group = nullptr;
     }
 
-    // DRM + CONTIG：内核从 CMA 拿物理连续内存，相当于这块板子上的 “MMZ”。
-    // 不申请 NORMAL（malloc）缓冲，那种内存 RGA 不能用 fd 导入，只能 CPU 搬。
-    const MppBufferType type =
-        static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CONTIG);
+    // 物理连续内存给 VPU、RGA 和显示控制器共用。
+    // ubuntu 用户对 /dev/dri 有 ACL，对 /dev/dma_heap 没有写权限，所以先试 DRM。
+    const MppBufferType types[] = {
+        static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CONTIG),
+        static_cast<MppBufferType>(MPP_BUFFER_TYPE_DMA_HEAP | MPP_BUFFER_FLAGS_CONTIG),
+    };
+    const char* names[] = {"DRM CMA", "dma-heap CMA"};
     MppBufferGroup group = nullptr;
-    MPP_RET ret = mpp_buffer_group_get_internal(&group, type);
-    if (ret != MPP_OK || group == nullptr) {
-        return Status::Fail("DRM contiguous buffer group alloc failed: " + std::to_string(ret));
+    const char* chosen = nullptr;
+    MPP_RET ret = MPP_NOK;
+    for (std::size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+        ret = mpp_buffer_group_get_internal(&group, types[i]);
+        if (ret == MPP_OK && group != nullptr) {
+            chosen = names[i];
+            break;
+        }
+        group = nullptr;
+    }
+    if (group == nullptr) {
+        return Status::Fail("contiguous NV12 buffer group alloc failed: " + std::to_string(ret));
     }
     ret = mpp_buffer_group_limit_config(group, buf_size, config_.decoder_buf_count);
     if (ret != MPP_OK) {
@@ -158,7 +170,7 @@ Status MppDecoder::ensure_buffer_group(void* frame_ptr) {
         return Status::Fail("MPP_DEC_SET_INFO_CHANGE_READY failed");
     }
     impl_->group = group;
-    YR_LOGI("NV12 DRM buffers %ux%u stride %ux%u size=%zu count=%d", width, height, hor, ver, buf_size,
+    YR_LOGI("NV12 %s buffers %ux%u stride %ux%u size=%zu count=%d", chosen, width, height, hor, ver, buf_size,
             config_.decoder_buf_count);
     return Status::Ok();
 }
@@ -191,6 +203,14 @@ Status MppDecoder::drain(std::vector<DecodedFrame>& frames) {
         const RK_U32 fmt = static_cast<RK_U32>(mpp_frame_get_fmt(frame));
         const RK_U32 family = fmt & MPP_FRAME_FMT_MASK;
         const RK_U32 id = fmt & ~MPP_FRAME_FMT_MASK;
+        if (MPP_FRAME_FMT_IS_FBC(fmt)) {
+            if (!warned_format_) {
+                YR_LOGE("VPU frame %#x is AFBC. RK3588 RGA needs linear NV12, drop this frame", fmt);
+                warned_format_ = true;
+            }
+            mpp_frame_deinit(&frame);
+            continue;
+        }
         if (family != MPP_FRAME_FMT_YUV || id != static_cast<RK_U32>(MPP_FMT_YUV420SP)) {
             if (!warned_format_) {
                 YR_LOGE("VPU frame format %#x is not NV12. Drop it. CPU color conversion is not available",
