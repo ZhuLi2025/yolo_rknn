@@ -3,7 +3,8 @@
  * @brief 在 CPU 读取 RGA 写过的 dma-buf 之前，通知内核把对应 cache 作废。
  *
  * RGA 走 DMA 写内存。若这块 DRM buffer 是 cacheable 的，CPU 仍可能读到旧 cache。
- * RKNN 1.7 的 rknn_inputs_set 会从用户态指针把张量拷进 NPU，这次拷贝必须看到 RGA 的新数据。
+ * 缓冲若是 cacheable 的，CPU 或退回 rknn_inputs_set 的那次拷贝必须先看到 RGA 的新数据。
+ * 非 cacheable 的 dma-buf 交给 RKNN2 做 fd 导入时，不需要这次同步。
  */
 #pragma once
 

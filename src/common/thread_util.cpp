@@ -28,7 +28,12 @@ void apply_thread_attr(const ThreadAttr& attr) {
         if (rc != 0) {
             YR_LOGW("bind cpu%d failed: %d", attr.cpu, rc);
         } else {
-            const char* kind = (attr.cpu >= 4) ? "A72" : "A53";
+            const char* kind = "cpu";
+            if (attr.cpu >= 0 && attr.cpu <= 3) {
+                kind = "A55";
+            } else if (attr.cpu >= 4 && attr.cpu <= 7) {
+                kind = "A76";
+            }
             YR_LOGI("thread %s bound to cpu%d (%s)", attr.name ? attr.name : "?", attr.cpu, kind);
         }
     }

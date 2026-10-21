@@ -5,18 +5,14 @@
 #include "yolo_rknn/display/osd_painter.hpp"
 #include "yolo_rknn/preprocess/rga_lock.hpp"
 
+#include "im2d.h"
+
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-
-extern "C" {
-#include "RgaApi.h"
-#include "rga.h"
-}
 
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
-#include <mutex>
 #include <string>
 #include <vector>
 #include <sys/ioctl.h>
@@ -226,7 +222,7 @@ Status DrmDisplay::init() {
     }
     if (chosen == nullptr) {
         drmModeFreeResources(res);
-        return Status::Fail("no connected display with a mode. HDMI-A-1 is unplugged");
+        return Status::Fail("no connected display with a mode. HDMI-A-1, HDMI-A-2 and DP-1 are unplugged");
     }
 
     impl_->connector_id = chosen->connector_id;
@@ -453,26 +449,24 @@ void DrmDisplay::update_osd(const InferenceResult& result) {
     }
 
     // 整块清透明交给 RGA。CPU 只描边和写字，避免每帧 memset 一张 1080p。
-    rga_info_t dst;
-    std::memset(&dst, 0, sizeof(dst));
-    dst.fd = impl_->osd_prime;
-    dst.mmuFlag = 1;
-    dst.format = RK_FORMAT_BGRA_8888;
-    dst.color = 0;
     const int stride_px = impl_->osd_pitch / 4;
-    rga_set_rect(&dst.rect, 0, 0, impl_->osd_w, impl_->osd_h, stride_px, impl_->osd_h, RK_FORMAT_BGRA_8888);
-    int filled = -1;
+    rga_buffer_t dst = wrapbuffer_fd_t(impl_->osd_prime, impl_->osd_w, impl_->osd_h, stride_px, impl_->osd_h,
+                                      RK_FORMAT_BGRA_8888);
+    im_rect rect;
+    rect.x = 0;
+    rect.y = 0;
+    rect.width = impl_->osd_w;
+    rect.height = impl_->osd_h;
+    IM_STATUS filled = IM_STATUS_FAILED;
     {
-        static std::once_flag rga_once;
-        std::call_once(rga_once, [] { c_RkRgaInit(); });
         RgaApiLock lock;
-        filled = c_RkRgaColorFill(&dst);
+        filled = imfill(dst, rect, 0);
     }
     if (!dma_buf_begin_cpu_write(impl_->osd_prime) && !impl_->sync_warned) {
         YR_LOGW("OSD dma-buf sync failed; boxes may flicker if the scanout cache is stale");
         impl_->sync_warned = true;
     }
-    if (filled != 0) {
+    if (filled != IM_STATUS_SUCCESS && filled != IM_STATUS_NOERROR) {
         std::memset(impl_->osd_map, 0, static_cast<size_t>(impl_->osd_map_size));
     }
     OsdCanvas canvas;

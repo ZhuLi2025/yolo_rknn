@@ -202,6 +202,7 @@ void Pipeline::infer_main() {
             notify_fail(st.message());
             return;
         }
+        detector->bind_input(pre.buffer_fd(), pre.buffer_ptr(), pre.buffer_bytes());
     } else {
         YR_LOGI("decode_only: RGA still runs, NPU is skipped");
     }

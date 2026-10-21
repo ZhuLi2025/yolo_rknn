@@ -2,20 +2,20 @@
 
 ## 转换
 
-运行时加载 `.rknn`，不在板子上做转换。本机库是 RKNN API 1.7.5，模型要用 RKNN-Toolkit 1.x 导出，`target_platform` 填 `rk3399pro`。
+运行时加载 `.rknn`，不在板子上做转换。本机库是 RKNN Runtime 2（`librknnrt.so` 1.5.2），模型要用 RKNN-Toolkit2 导出，`target_platform` 填 `rk3588`。
 
-Toolkit2 的产物（RV1126、RK3566、RK3588）和这份 API 不兼容，`rknn_init` 会失败。失败日志里会写明这一点。
+Toolkit 1.x 的产物（RK3399Pro）和其他平台的 Toolkit2 模型都不兼容，`rknn_init` 会失败。失败日志里会写明这一点。
 
 输入请做成：
 
-- 640x640（或和 `model_width` / `model_height` 一致，且为偶数）
+- 640x640（或和 `model_width` / `model_height` 一致，且为 16 的倍数）
 - uint8
 - NHWC
 - RGB，数值范围 0–255，不要在模型里再要求减均值。RGA 输出的就是这张图
 
-尺寸和 `n_elems` 对不上时，初始化直接失败，并打印 `rknn_query` 看到的 shape。对得上、并且类型已经是 uint8 NHWC 时，`pass_through=1`，驱动不再做一次布局转换。类型是 float 或 NCHW 时，`pass_through=0`，由驱动把这张 RGB888 转成模型内部输入。这一步仍然只发生在模型输入上。
+尺寸和 `n_elems` 对不上时，初始化直接失败，并打印 `rknn_query` 看到的 shape。对得上、并且类型已经是 uint8 NHWC、宽高 stride 没有额外填充时，`pass_through=1`，驱动不再做一次布局转换。类型是 float、NCHW，或带 stride 时，`pass_through=0`，由驱动把这块 dma-buf 里的 RGB888 转成模型内部输入。
 
-`RKNN_FLAG_ASYNC_MASK` 没有打开。那个模式取回的是上一帧的结果，业务变焦会跟着旧框走。
+`rknn_set_core_mask` 按 `npu_cores` 设置。默认 `0_1_2`，三核一起跑这一帧。`RKNN_FLAG_ASYNC_MASK` 没有打开。那个模式取回的是上一帧的结果，业务变焦会跟着旧框走。
 
 输出缓冲在初始化时按 `n_elems * sizeof(float)` 预分配，`rknn_outputs_get` 使用 `want_float=1` 和 `is_prealloc=1`。后处理因此不用每帧 malloc，量化反算留在驱动里。
 
@@ -62,12 +62,15 @@ Ultralytics 导出再转 RKNN 时最常见。
 
 ## YOLOv3
 
-`decode_yolov3` 按 darknet 的检测头解码。YOLOv3-tiny 是 2 个头，完整 YOLOv3 是 3 个头。每个头的通道数是 `3 * (5 + nc)`：3 个 anchor，每个 anchor 是 `tx, ty, tw, th, objectness` 再加 `nc` 个类别。本机的 `yolov3_tiny_rk3399pro.rknn` 查询结果是：
+`decode_yolov3` 按 darknet 的检测头解码。YOLOv3-tiny 是 2 个头，完整 YOLOv3 是 3 个头。每个头的通道数是 `3 * (5 + nc)`：3 个 anchor，每个 anchor 是 `tx, ty, tw, th, objectness` 再加 `nc` 个类别。
 
-- 输入 `[416, 416, 3, 1]`，uint8，416x416
-- 输出 `[13, 13, 255, 1]` 和 `[26, 26, 255, 1]`，`fmt` 是 NCHW
+Toolkit2 在 RK3588 上的维度顺序以 `rknn_query` 的日志为准。下面这组是以前在 RK3399Pro、Toolkit 1.x 上看到的，换平台后不要照抄，只说明后处理同时认这几种排法：
 
-Toolkit 1.x 把 NCHW 的维度倒着填，所以 `[13, 13, 255, 1]` 的内存仍是 `[1, 255, 13, 13]` 的平面排列。标准的 `[1, C, H, W]` 和 NHWC 的 `[1, H, W, C]` 也认。stride 用 `model_width / grid_width` 算，416 上分别是 32 和 16。
+- 输入常见为 uint8，416x416
+- 输出可能是 `[1, 255, 13, 13]`，也可能被 1.x 记成 `[13, 13, 255, 1]`
+- `fmt` 决定按 NCHW 还是 NHWC 索引
+
+标准的 `[1, C, H, W]` 和 NHWC 的 `[1, H, W, C]` 都认。stride 用 `model_width / grid_width` 算。
 
 解码：
 

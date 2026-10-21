@@ -3,7 +3,7 @@
 #include "yolo_rknn/common/logger.hpp"
 #include "yolo_rknn/infer/postprocess.hpp"
 
-#include <rockchip/rknn_api.h>
+#include <rknn_api.h>
 
 #include <chrono>
 #include <cstdint>
@@ -47,12 +47,37 @@ bool input_matches(const rknn_tensor_attr& attr, int width, int height) {
 
 }  // namespace
 
+namespace {
+
+rknn_core_mask core_mask_from_config(const std::string& name) {
+    if (name == "0") {
+        return RKNN_NPU_CORE_0;
+    }
+    if (name == "1") {
+        return RKNN_NPU_CORE_1;
+    }
+    if (name == "2") {
+        return RKNN_NPU_CORE_2;
+    }
+    if (name == "0_1") {
+        return RKNN_NPU_CORE_0_1;
+    }
+    if (name == "0_1_2") {
+        return RKNN_NPU_CORE_0_1_2;
+    }
+    return RKNN_NPU_CORE_AUTO;
+}
+
+}  // namespace
+
 struct YoloV8Detector::Impl {
     rknn_context ctx = 0;
     rknn_tensor_attr input;
+    rknn_tensor_mem* input_mem = nullptr;
     std::vector<rknn_tensor_attr> outputs;
     std::vector<std::vector<float>> host;
     bool pass_through = false;
+    bool zero_copy = false;
     bool layout_warned = false;
     std::vector<float> anchors;
 
@@ -66,6 +91,10 @@ YoloV8Detector::~YoloV8Detector() {
         return;
     }
     if (impl_->ctx) {
+        if (impl_->input_mem) {
+            rknn_destroy_mem(impl_->ctx, impl_->input_mem);
+            impl_->input_mem = nullptr;
+        }
         rknn_destroy(impl_->ctx);
         impl_->ctx = 0;
     }
@@ -84,10 +113,20 @@ Status YoloV8Detector::init() {
     }
 
     // 不用 RKNN_FLAG_ASYNC_MASK：那个模式取回的是上一帧的结果。
-    const int ret = rknn_init(&impl_->ctx, model.data(), static_cast<uint32_t>(model.size()), RKNN_FLAG_PRIOR_HIGH);
+    // RKNN2 的 rknn_init 多一个 extend 参数，传空表示模型就在这块内存里。
+    const int ret = rknn_init(&impl_->ctx, model.data(), static_cast<uint32_t>(model.size()), RKNN_FLAG_PRIOR_HIGH,
+                              nullptr);
     if (ret != RKNN_SUCC) {
         return Status::Fail("rknn_init failed: " + std::to_string(ret) +
-                            " (model must be converted for RK3399Pro with RKNN toolkit 1.x)");
+                            " (model must be converted for rk3588 with RKNN-Toolkit2)");
+    }
+
+    const rknn_core_mask cores = core_mask_from_config(config_.npu_cores);
+    const int core_ret = rknn_set_core_mask(impl_->ctx, cores);
+    if (core_ret != RKNN_SUCC) {
+        YR_LOGW("rknn_set_core_mask %s -> %d", config_.npu_cores.c_str(), core_ret);
+    } else {
+        YR_LOGI("rknn cores=%s", config_.npu_cores.c_str());
     }
 
     rknn_sdk_version ver;
@@ -172,32 +211,72 @@ Status YoloV8Detector::init() {
     return Status::Ok();
 }
 
+void YoloV8Detector::bind_input(int fd, void* virt, std::size_t bytes) {
+    if (impl_->ctx == 0 || impl_->zero_copy || fd < 0 || virt == nullptr) {
+        return;
+    }
+    const std::size_t packed =
+        static_cast<std::size_t>(config_.model_width) * static_cast<std::size_t>(config_.model_height) * 3u;
+    if (bytes < packed) {
+        YR_LOGW("preprocess buffer %zu is smaller than RGB888 %zu, keep rknn_inputs_set", bytes, packed);
+        return;
+    }
+
+    rknn_tensor_mem* mem = rknn_create_mem_from_fd(impl_->ctx, fd, virt, static_cast<uint32_t>(bytes), 0);
+    if (mem == nullptr) {
+        YR_LOGW("rknn_create_mem_from_fd failed, keep rknn_inputs_set");
+        return;
+    }
+
+    rknn_tensor_attr attr = impl_->input;
+    const bool tight_stride = (attr.w_stride == 0 || attr.w_stride == static_cast<uint32_t>(config_.model_width)) &&
+                              (attr.h_stride == 0 || attr.h_stride == static_cast<uint32_t>(config_.model_height));
+    if (impl_->pass_through && tight_stride) {
+        attr.pass_through = 1;
+    } else {
+        // 驱动按 UINT8 NHWC 读这块 dma-buf，再转成模型内部布局。转换不经过用户态拷贝。
+        attr.pass_through = 0;
+        attr.type = RKNN_TENSOR_UINT8;
+        attr.fmt = RKNN_TENSOR_NHWC;
+    }
+    const int ret = rknn_set_io_mem(impl_->ctx, mem, &attr);
+    if (ret != RKNN_SUCC) {
+        YR_LOGW("rknn_set_io_mem failed: %d, keep rknn_inputs_set", ret);
+        rknn_destroy_mem(impl_->ctx, mem);
+        return;
+    }
+    impl_->input_mem = mem;
+    impl_->zero_copy = true;
+    YR_LOGI("rknn input zero-copy fd=%d pass_through=%u bytes=%zu", fd, attr.pass_through, bytes);
+}
+
 Status YoloV8Detector::infer(const PreprocessResult& input, InferenceResult& result) {
     if (impl_->ctx == 0) {
         return Status::Fail("detector is not initialized");
     }
-    if (input.rgb == nullptr || input.bytes == 0) {
+    if (input.bytes == 0 || (input.rgb == nullptr && !impl_->zero_copy)) {
         return Status::Fail("empty preprocess buffer");
     }
 
-    rknn_input feed;
-    std::memset(&feed, 0, sizeof(feed));
-    feed.index = 0;
-    feed.buf = const_cast<std::uint8_t*>(input.rgb);
-    feed.size = static_cast<uint32_t>(input.bytes);
-    if (impl_->pass_through) {
-        feed.pass_through = 1;
-    } else {
-        // 驱动把 RGB888 转成模型内部布局。这一步只发生在模型输入张量上。
-        feed.pass_through = 0;
-        feed.type = RKNN_TENSOR_UINT8;
-        feed.fmt = RKNN_TENSOR_NHWC;
-    }
-
     const auto t0 = std::chrono::steady_clock::now();
-    int ret = rknn_inputs_set(impl_->ctx, 1, &feed);
-    if (ret != RKNN_SUCC) {
-        return Status::Fail("rknn_inputs_set failed: " + std::to_string(ret));
+    int ret = RKNN_SUCC;
+    if (!impl_->zero_copy) {
+        rknn_input feed;
+        std::memset(&feed, 0, sizeof(feed));
+        feed.index = 0;
+        feed.buf = const_cast<std::uint8_t*>(input.rgb);
+        feed.size = static_cast<uint32_t>(input.bytes);
+        if (impl_->pass_through) {
+            feed.pass_through = 1;
+        } else {
+            feed.pass_through = 0;
+            feed.type = RKNN_TENSOR_UINT8;
+            feed.fmt = RKNN_TENSOR_NHWC;
+        }
+        ret = rknn_inputs_set(impl_->ctx, 1, &feed);
+        if (ret != RKNN_SUCC) {
+            return Status::Fail("rknn_inputs_set failed: " + std::to_string(ret));
+        }
     }
     ret = rknn_run(impl_->ctx, nullptr);
     if (ret != RKNN_SUCC) {

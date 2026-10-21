@@ -6,7 +6,7 @@
 namespace yolo_rknn {
 namespace {
 
-// 与内核 include/uapi/linux/dma-buf.h 一致。不直接包含那个头，避免和老 4.4 头文件打架。
+// 与内核 include/uapi/linux/dma-buf.h 一致。本机内核是 5.10，ioctl 号没有变。
 struct DmaBufSync {
     std::uint64_t flags;
 };

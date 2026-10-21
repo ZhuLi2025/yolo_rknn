@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 
-# 在设备上原生编译，不走交叉工具链。
-# 编译器：Ubuntu 18.04 自带的 g++ 7.5，因此锁定 C++14，不使用 filesystem / optional 等 C++17 库设施。
-project(yolo_rknn VERSION 0.1.0 LANGUAGES CXX)
+# 在 RK3588 上原生编译，不走交叉工具链。
+# 本机是 Ubuntu 20.04 的 g++ 9.4。代码仍锁在 C++14，不使用 filesystem / optional。
+project(yolo_rknn VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,9 +14,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Debug or Release" FORCE)
 endif()
 
-# FFmpeg 在 /usr/local/lib。RKNN 的 rpath 在找到库之后再补，避免运行时捞到 Android 版同名库。
-set(CMAKE_BUILD_RPATH "/usr/local/lib")
-set(CMAKE_INSTALL_RPATH "/usr/local/lib")
+# FFmpeg、MPP、RGA、RKNN 都在系统库目录里。
+set(CMAKE_BUILD_RPATH "/usr/lib;/usr/local/lib")
+set(CMAKE_INSTALL_RPATH "/usr/lib;/usr/local/lib")
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE)
 
@@ -38,24 +38,10 @@ yr_require_lib(YR_AVCODEC NAMES avcodec PATHS /usr/local/lib /usr/lib/aarch64-li
 yr_require_lib(YR_AVUTIL NAMES avutil PATHS /usr/local/lib /usr/lib/aarch64-linux-gnu)
 yr_require_lib(YR_DRM NAMES drm PATHS /usr/lib/aarch64-linux-gnu /usr/lib)
 
-# /usr/local/lib/librknn_api.so 是 Android 版（依赖 liblog.so，符号版本是 LIBC），在这台 Linux 上链不了。
-# 板子上的 Linux 用户态库在 NPU SDK 目录里，和头文件 API 1.7.5 对应。
-set(YR_RKNN_CANDIDATES
-    /home/firefly/NPU/RK3399Pro_npu/rknn-api/librknn_api/Linux/lib64/librknn_api.so
-    /home/firefly/workspace/RKNN/RKNN-1.3.0/rknn-api/Linux/rknn_api_sdk/rknn_api/lib64/librknn_api.so
-)
-set(YR_RKNN "")
-foreach(candidate ${YR_RKNN_CANDIDATES})
-    if(EXISTS ${candidate})
-        set(YR_RKNN ${candidate})
-        break()
-    endif()
-endforeach()
-if(NOT YR_RKNN)
-    message(FATAL_ERROR "找不到 Linux 版 librknn_api.so。/usr/local/lib 里的是 Android 库，不能用。")
-endif()
+# RK3588 的用户态是 RKNN Runtime 2（librknnrt.so），不是 RK3399Pro 的 librknn_api.so。
+yr_require_lib(YR_RKNN NAMES rknnrt PATHS /usr/lib /lib /usr/lib/aarch64-linux-gnu)
 get_filename_component(YR_RKNN_DIR ${YR_RKNN} DIRECTORY)
-message(STATUS "Using Linux RKNN library: ${YR_RKNN}")
+message(STATUS "Using RKNN runtime: ${YR_RKNN}")
 
 set(YR_SOURCES
     src/common/logger.cpp
@@ -78,7 +64,7 @@ set(YR_SOURCES
 add_library(yolo_core STATIC ${YR_SOURCES})
 target_include_directories(yolo_core
     PUBLIC ${PROJECT_SOURCE_DIR}/include
-    PRIVATE /usr/include/rockchip /usr/local/include /usr/include/libdrm
+    PRIVATE /usr/include/rockchip /usr/include/rga /usr/local/include /usr/include/libdrm
 )
 target_compile_definitions(yolo_core PUBLIC YR_VERSION=\"${PROJECT_VERSION}\")
 target_link_libraries(yolo_core

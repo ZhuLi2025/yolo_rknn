@@ -1,27 +1,27 @@
 # 线程
 
-RK3399Pro 有 2 个 Cortex-A72（cpu4、cpu5）和 4 个 Cortex-A53（cpu0–cpu3）。它不是一颗扛不住软解的单核 A7，但 1080p/4K 软解仍然会把内存带宽和 CPU 占满，所以软解这条路在代码里不存在。绑核是为了让收包和送 NPU 不要抢同一颗核，也避免业务线程的串口和策略计算插进拉流线程。
+RK3588 有 4 个 Cortex-A76 和 4 个 Cortex-A55。A76 分成两簇：cpu4–cpu5 最高 2.35 GHz，cpu6–cpu7 最高 2.4 GHz。A55 是 cpu0–cpu3，最高 1.8 GHz。1080p/4K 软解仍然会把内存带宽和 CPU 占满，所以软解这条路在代码里不存在。绑核是为了让收包和后处理不要抢同一簇的 L2，也避免业务线程的串口和策略计算插进拉流线程。
 
 ## 分工
 
-### yr_stream，默认 cpu4，SCHED_FIFO 50
+### yr_stream，默认 cpu6，SCHED_FIFO 50
 
 只做两件事：从 `RtspClient::read` 拿 Annex-B，调用 `MppDecoder::decode`。MPP 的 put/get 都在这一个线程里。不要再拆一个“只收包”的线程把码流队列做深，那会把延迟堆回去，也让 MPP context 跨线程。
 
 队列满时在这个线程里丢掉最旧的 `DecodedFrame`。丢弃发生在队列锁外面，`mpp_frame_deinit` 不会占着队列锁。
 
-### yr_infer，默认 cpu5，SCHED_FIFO 30
+### yr_infer，默认 cpu4，SCHED_FIFO 30
 
 创建 `RgaPreprocessor` 和 `YoloV8Detector`。循环：
 
 1. 取出一帧 NV12
 2. RGA letterbox 到模型输入
 3. 立刻释放 NV12，把 DRM buffer 还给 VPU
-4. `rknn_inputs_set` + `rknn_run` + `rknn_outputs_get`
-5. 结束 dma-buf 的 CPU 读同步
+4. `rknn_run` + `rknn_outputs_get`。输入 fd 在线程启动时已经 `rknn_set_io_mem`
+5. 若目标缓冲是 cacheable 的，结束 dma-buf 的 CPU 读同步
 6. 把 `InferenceResult` 推进业务队列
 
-NPU 在跑的时候，这颗 A72 大部分时间在等驱动返回。把它和拉流线程分开，是避免 `rknn_inputs_set` 里的拷贝卡住收包。
+NPU 在跑的时候，这颗 A76 大部分时间在等驱动返回。把它和拉流线程分到两个簇，是避免后处理的 NMS 卡住收包。
 
 `--decode-only` 时这一线程仍然做第 2 步。跳过 RGA 就看不出预处理有没有掉回 CPU。
 
