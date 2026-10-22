@@ -64,17 +64,23 @@ group 限制为 `decoder_buf_count`（默认 12）张，尺寸是 VPU 报上来�
 
 目标是一块单独的物理连续缓冲，大小为 `model_width * model_height * 3`。分配顺序是 DRM CMA、dma-heap CMA，然后才是这两种的 cacheable 版本。非 cacheable 时 RGA 写完，NPU 可以直接读，中间不做 CPU cache 同步。
 
+`preprocess` 决定采样窗口，两种都由 `plan_model_window` 算出偶数对齐的源矩形和目标矩形：
+
+- `letterbox`：整幅图按较短的一边缩进模型，空边用 `imfill` 涂成 114 灰（`0x727272`）
+- `short_side` 且 `batch_size=1`：短边缩放到模型边，长边居中裁掉。1920x1080 送到 640 时，源矩形是中间的 1080x1080
+- `short_side` 且 `batch_size=2`：同样的缩放，但贴左、贴右各出一张。1920x1080 是 `0,0 1080x1080` 和 `840,0 1080x1080`，写进两块 RGB dma-buf。两张 RGA 缩放仍串行，NPU 再并行
+
 每一帧：
 
-1. `imfill` 把目标涂成 114 灰（`0x727272`），和常见 YOLO letterbox 的填充值一致
-2. `improcess` 把 NV12 按短边缩放到目标中央，坐标和宽高都对齐到偶数。源的宽高 stride 用 MPP 的 hor/ver stride，不是有效宽高
+1. letterbox 才 `imfill`。short_side 的目标矩形已经铺满，跳过填灰
+2. `improcess` 只缩放这个源矩形。源的宽高 stride 用 MPP 的 hor/ver stride，不是有效宽高
 3. 只有缓冲是 cacheable 时，才用 `DMA_BUF_IOCTL_SYNC` 作废 CPU cache
 
 librga 自己在 RGA2 和 RGA3 之间选核。模型宽高必须是 16 的倍数，否则 RGA3 会拒绝这张 RGB888。失败时返回错误字符串，调用方丢帧。没有第二套实现。
 
 `finish_cpu_read()` 在推理返回后调用。非 cacheable 时它是空操作。预处理类不是线程安全的，只允许推理线程使用。显示线程清 OSD 时走同一把 `RgaApiLock`。
 
-letterbox 的 `scale`、`pad_x`、`pad_y` 交给后处理，把模型坐标系的框映射回原图。缩放比用对齐之后的整数宽除以源宽，避免偶数对齐带来的半个像素误差。
+`scale`、`pad_x`、`pad_y` 交给后处理，把模型坐标系的框映射回原图。letterbox 的 pad 是灰边。short_side 的 pad 是负数，等于被裁掉的原图距离乘上 scale。显示扫的仍是完整 NV12，裁掉的区域只是不进模型。
 
 ## 输入怎么进 NPU
 

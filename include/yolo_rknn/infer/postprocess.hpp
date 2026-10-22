@@ -28,14 +28,48 @@
 namespace yolo_rknn {
 
 struct LetterboxMeta {
-    float scale = 1.f;     // 原图边长乘上 scale 得到放进模型输入的边长
-    int pad_x = 0;
-    int pad_y = 0;
+    float scale = 1.f;  // 原图边长乘上 scale 得到放进模型输入的边长
+    // letterbox 时是灰边。short_side 时是负的，表示模型坐标 0 左边被裁掉的原图距离（已乘 scale）。
+    float pad_x = 0.f;
+    float pad_y = 0.f;
     int src_width = 0;
     int src_height = 0;
     int model_width = 0;
     int model_height = 0;
 };
+
+// letterbox：整图缩进模型，空边填灰。short_side：短边缩放到模型边，长边裁掉。
+enum class InputFit {
+    Letterbox = 0,
+    ShortSide = 1,
+};
+
+// short_side 的裁剪锚点。Center 是单张居中。Start/End 贴长边的两端，给 batch=2 的左右（或上下）两张。
+enum class WindowAnchor {
+    Center = 0,
+    Start = 1,
+    End = 2,
+};
+
+// RGA 实际采样的原图矩形，以及它写进模型输入的矩形。坐标都是偶数对齐后的像素。
+struct ModelWindow {
+    int src_x = 0;
+    int src_y = 0;
+    int src_w = 0;
+    int src_h = 0;
+    int dst_x = 0;
+    int dst_y = 0;
+    int dst_w = 0;
+    int dst_h = 0;
+    bool fill = true;
+    LetterboxMeta meta;
+};
+
+bool plan_model_window(InputFit fit, int src_w, int src_h, int model_w, int model_h, ModelWindow* window,
+                       WindowAnchor anchor = WindowAnchor::Center);
+
+// 两张切片映回原图后去重。除了 IoU，小框大部分落在大框里也算同一个目标。
+std::vector<Detection> suppress_overlaps(std::vector<Detection> dets, float iou_threshold, int max_det);
 
 struct RawTensor {
     std::vector<int> dims;

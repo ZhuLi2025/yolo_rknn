@@ -97,13 +97,15 @@ score = sigmoid(objectness) * sigmoid(class)
 
 ## 坐标回到原图
 
-RGA letterbox 的 `scale`、`pad_x`、`pad_y` 放在 `LetterboxMeta` 里。
+`scale`、`pad_x`、`pad_y` 放在 `LetterboxMeta` 里。`preprocess=letterbox` 和 `preprocess=short_side` 共用这一条：
 
 ```text
 原图坐标 = (模型坐标 - pad) / scale
 ```
 
-然后夹到原图范围内。宽或高小于 1 像素的框丢掉。
+letterbox 的 pad 是灰边，为正。short_side 没有灰边，pad 为负，模型左上角对应裁剪窗口的左上角，而不是原图左上角。然后夹到原图范围内。宽或高小于 1 像素的框丢掉。画面本身始终是完整原图。
+
+`batch_size=2` 只在 `preprocess=short_side` 时改走两张切片。模型文件保持 batch=1。运行时 `rknn_dup_context` 出第二个 context，core0 跑贴起始边的那张，core1 跑贴结束边的那张，两个 `rknn_run` 同时进行。两张的框都映回原图后再做一次 NMS。`batch_size=1` 仍是一个 context，核掩码用 `npu_cores`。
 
 NMS 按类别分开，IoU 阈值是 `nms_threshold`，保留不超过 `max_detections` 个，按分数从高到低。
 

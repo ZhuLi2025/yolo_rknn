@@ -202,7 +202,9 @@ void Pipeline::infer_main() {
             notify_fail(st.message());
             return;
         }
-        detector->bind_input(pre.buffer_fd(), pre.buffer_ptr(), pre.buffer_bytes());
+        for (int tile = 0; tile < pre.tile_count(); ++tile) {
+            detector->bind_input(tile, pre.buffer_fd(tile), pre.buffer_ptr(tile), pre.buffer_bytes(tile));
+        }
     } else {
         YR_LOGI("decode_only: RGA still runs, NPU is skipped");
     }
@@ -217,8 +219,9 @@ void Pipeline::infer_main() {
             break;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        PreprocessResult prep;
-        st = pre.process(frame, prep);
+        PreprocessResult tiles[2];
+        int ntiles = 2;
+        st = pre.process(frame, tiles, &ntiles);
         // RGA ioctl 返回后 NV12 不再被使用，立刻还回 VPU 的 buffer pool。
         frame.retain.reset();
         frame.fd = -1;
@@ -236,7 +239,7 @@ void Pipeline::infer_main() {
         result.src_height = frame.height;
         result.preprocess_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (detector) {
-            st = detector->infer(prep, result);
+            st = detector->infer(tiles, ntiles, result);
         }
         pre.finish_cpu_read();
         if (detector && !st.ok()) {

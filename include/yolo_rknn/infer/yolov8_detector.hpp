@@ -5,6 +5,9 @@
  *
  * bind_input() 用 rknn_create_mem_from_fd 把 RGA 的目标 dma-buf 交给片内 NPU。
  * 导入失败时 infer() 退回 rknn_inputs_set，仍然要求 rgb 是紧凑 RGB888。
+ *
+ * batch_size=2 且 preprocess=short_side 时再 dup 出一个 context：core0 跑贴起始边的那张，
+ * core1 跑贴结束边的那张，两个 rknn_run 同时进行。模型文件保持 batch=1。
  */
 #pragma once
 
@@ -26,7 +29,9 @@ public:
     Status init();
     // fd 在整个推理线程的生命周期里保持有效。失败只记日志，不让 pipeline 退出。
     void bind_input(int fd, void* virt, std::size_t bytes);
+    void bind_input(int tile, int fd, void* virt, std::size_t bytes);
     Status infer(const PreprocessResult& input, InferenceResult& result);
+    Status infer(const PreprocessResult* tiles, int tile_count, InferenceResult& result);
 
 private:
     struct Impl;

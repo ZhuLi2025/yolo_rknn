@@ -68,14 +68,48 @@ float iou(const Detection& a, const Detection& b) {
     return inter / uni;
 }
 
+float intersection_over_smaller(const Detection& a, const Detection& b) {
+    const float ax2 = a.x + a.w;
+    const float ay2 = a.y + a.h;
+    const float bx2 = b.x + b.w;
+    const float by2 = b.y + b.h;
+    const float iw = std::min(ax2, bx2) - std::max(a.x, b.x);
+    const float ih = std::min(ay2, by2) - std::max(a.y, b.y);
+    if (iw <= 0.f || ih <= 0.f) {
+        return 0.f;
+    }
+    const float smaller = std::min(a.w * a.h, b.w * b.h);
+    if (smaller <= 0.f) {
+        return 0.f;
+    }
+    return (iw * ih) / smaller;
+}
+
+bool center_inside(const Detection& inner, const Detection& outer) {
+    const float cx = inner.x + inner.w * 0.5f;
+    const float cy = inner.y + inner.h * 0.5f;
+    return cx >= outer.x && cx <= outer.x + outer.w && cy >= outer.y && cy <= outer.y + outer.h;
+}
+
+// 切片交界上，一边常是被裁断的小框，和另一边的完整框 IoU 会掉到阈值以下。
+// 小框大部分落在大框里，或任一框的中心落在另一框内，都当成同一个目标。
+bool same_tiled_target(const Detection& a, const Detection& b, float iou_threshold) {
+    const float overlap = iou(a, b);
+    const float covered = intersection_over_smaller(a, b);
+    if (overlap > iou_threshold || covered >= 0.55f) {
+        return true;
+    }
+    return covered >= 0.30f && (center_inside(a, b) || center_inside(b, a));
+}
+
 void map_box(float x1, float y1, float x2, float y2, const LetterboxMeta& meta, Detection* det) {
     if (meta.scale <= 0.f) {
         return;
     }
-    x1 = (x1 - static_cast<float>(meta.pad_x)) / meta.scale;
-    y1 = (y1 - static_cast<float>(meta.pad_y)) / meta.scale;
-    x2 = (x2 - static_cast<float>(meta.pad_x)) / meta.scale;
-    y2 = (y2 - static_cast<float>(meta.pad_y)) / meta.scale;
+    x1 = (x1 - meta.pad_x) / meta.scale;
+    y1 = (y1 - meta.pad_y) / meta.scale;
+    x2 = (x2 - meta.pad_x) / meta.scale;
+    y2 = (y2 - meta.pad_y) / meta.scale;
     const float max_w = static_cast<float>(std::max(meta.src_width, 1));
     const float max_h = static_cast<float>(std::max(meta.src_height, 1));
     x1 = clampf(x1, 0.f, max_w);
@@ -702,6 +736,160 @@ DecodeResult decode_yolov5(const std::vector<RawTensor>& tensors, const DecodePa
     }
     result.detections = nms(std::move(dets), params.nms_threshold, params.max_detections);
     return result;
+}
+
+std::vector<Detection> suppress_overlaps(std::vector<Detection> dets, float iou_threshold, int max_det) {
+    std::sort(dets.begin(), dets.end(), [](const Detection& a, const Detection& b) {
+        return a.score > b.score;
+    });
+    std::vector<char> removed(dets.size(), 0);
+    std::vector<Detection> kept;
+    for (std::size_t i = 0; i < dets.size(); ++i) {
+        if (removed[i]) {
+            continue;
+        }
+        Detection chosen = dets[i];
+        for (std::size_t j = i + 1; j < dets.size(); ++j) {
+            if (removed[j] || dets[j].class_id != chosen.class_id) {
+                continue;
+            }
+            if (!same_tiled_target(chosen, dets[j], iou_threshold)) {
+                continue;
+            }
+            const float chosen_area = chosen.w * chosen.h;
+            const float other_area = dets[j].w * dets[j].h;
+            // 高分的那个如果只是贴着切片边的残框，留下更大的完整框。
+            if (other_area > chosen_area * 1.2f && center_inside(chosen, dets[j])) {
+                chosen = dets[j];
+            }
+            removed[j] = 1;
+        }
+        kept.push_back(chosen);
+        if (static_cast<int>(kept.size()) >= max_det) {
+            break;
+        }
+    }
+    return kept;
+}
+
+bool plan_model_window(InputFit fit, int src_w, int src_h, int model_w, int model_h, ModelWindow* window,
+                       WindowAnchor anchor) {
+    if (window == nullptr) {
+        return false;
+    }
+    *window = ModelWindow();
+    src_w &= ~1;
+    src_h &= ~1;
+    if (src_w < 2 || src_h < 2 || model_w < 2 || model_h < 2) {
+        return false;
+    }
+
+    window->meta.src_width = src_w;
+    window->meta.src_height = src_h;
+    window->meta.model_width = model_w;
+    window->meta.model_height = model_h;
+
+    if (fit == InputFit::ShortSide) {
+        // 短边刚好铺满模型，长边在原图上居中裁。裁完再缩放，和先缩放再裁中心是同一块区域。
+        const bool wider =
+            static_cast<long long>(src_w) * model_h > static_cast<long long>(src_h) * model_w;
+        int crop_w = src_w;
+        int crop_h = src_h;
+        int ox = 0;
+        int oy = 0;
+        if (wider) {
+            crop_w = static_cast<int>((static_cast<long long>(src_h) * model_w) / model_h) & ~1;
+            if (crop_w > src_w) {
+                crop_w = src_w;
+            }
+            if (crop_w < 2) {
+                return false;
+            }
+            if (anchor == WindowAnchor::Start) {
+                ox = 0;
+            } else if (anchor == WindowAnchor::End) {
+                ox = (src_w - crop_w) & ~1;
+            } else {
+                ox = ((src_w - crop_w) / 2) & ~1;
+            }
+            if (ox < 0) {
+                ox = 0;
+            }
+            if (ox + crop_w > src_w) {
+                crop_w = (src_w - ox) & ~1;
+            }
+        } else {
+            crop_h = static_cast<int>((static_cast<long long>(src_w) * model_h) / model_w) & ~1;
+            if (crop_h > src_h) {
+                crop_h = src_h;
+            }
+            if (crop_h < 2) {
+                return false;
+            }
+            if (anchor == WindowAnchor::Start) {
+                oy = 0;
+            } else if (anchor == WindowAnchor::End) {
+                oy = (src_h - crop_h) & ~1;
+            } else {
+                oy = ((src_h - crop_h) / 2) & ~1;
+            }
+            if (oy < 0) {
+                oy = 0;
+            }
+            if (oy + crop_h > src_h) {
+                crop_h = (src_h - oy) & ~1;
+            }
+        }
+        if (crop_w < 2 || crop_h < 2) {
+            return false;
+        }
+        window->src_x = ox;
+        window->src_y = oy;
+        window->src_w = crop_w;
+        window->src_h = crop_h;
+        window->dst_x = 0;
+        window->dst_y = 0;
+        window->dst_w = model_w;
+        window->dst_h = model_h;
+        window->fill = false;
+        window->meta.scale = static_cast<float>(model_w) / static_cast<float>(crop_w);
+        window->meta.pad_x = -static_cast<float>(ox) * window->meta.scale;
+        window->meta.pad_y = -static_cast<float>(oy) * window->meta.scale;
+        return window->meta.scale > 0.f;
+    }
+
+    const float scale_w = static_cast<float>(model_w) / static_cast<float>(src_w);
+    const float scale_h = static_cast<float>(model_h) / static_cast<float>(src_h);
+    const float scale = scale_w < scale_h ? scale_w : scale_h;
+    int new_w = static_cast<int>(static_cast<float>(src_w) * scale) & ~1;
+    int new_h = static_cast<int>(static_cast<float>(src_h) * scale) & ~1;
+    if (new_w < 2) {
+        new_w = 2;
+    }
+    if (new_h < 2) {
+        new_h = 2;
+    }
+    if (new_w > model_w) {
+        new_w = model_w;
+    }
+    if (new_h > model_h) {
+        new_h = model_h;
+    }
+    const int pad_x = ((model_w - new_w) / 2) & ~1;
+    const int pad_y = ((model_h - new_h) / 2) & ~1;
+    window->src_x = 0;
+    window->src_y = 0;
+    window->src_w = src_w;
+    window->src_h = src_h;
+    window->dst_x = pad_x;
+    window->dst_y = pad_y;
+    window->dst_w = new_w;
+    window->dst_h = new_h;
+    window->fill = true;
+    window->meta.scale = static_cast<float>(new_w) / static_cast<float>(src_w);
+    window->meta.pad_x = static_cast<float>(pad_x);
+    window->meta.pad_y = static_cast<float>(pad_y);
+    return window->meta.scale > 0.f;
 }
 
 }  // namespace yolo_rknn

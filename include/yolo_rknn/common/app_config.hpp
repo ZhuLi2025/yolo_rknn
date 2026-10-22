@@ -32,6 +32,10 @@ struct AppConfig {
     std::string npu_cores = "0_1_2";
     int model_width = 640;
     int model_height = 640;
+    // letterbox：整图缩进并填灰。short_side：短边缩放到模型边，长边裁掉。
+    std::string preprocess = "letterbox";
+    // 1：一个 context，核掩码用 npu_cores。2：仅 short_side 时左右两张并行，分别绑 core0 和 core1。
+    int batch_size = 1;
     // 仅 yolov3。每两个数是一个 anchor 的宽高，单位是模型输入像素。
     // 按 stride 从大到小，每个 stride 三个 anchor。空则按输出头个数用 COCO 默认值。
     std::vector<float> anchors;

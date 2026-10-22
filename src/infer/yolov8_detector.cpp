@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 namespace yolo_rknn {
@@ -70,6 +71,18 @@ rknn_core_mask core_mask_from_config(const std::string& name) {
 
 }  // namespace
 
+struct SideContext {
+    rknn_context ctx = 0;
+    rknn_tensor_attr input;
+    rknn_tensor_mem* input_mem = nullptr;
+    std::vector<rknn_tensor_attr> outputs;
+    std::vector<std::vector<float>> host;
+    bool pass_through = false;
+    bool zero_copy = false;
+
+    SideContext() { std::memset(&input, 0, sizeof(input)); }
+};
+
 struct YoloV8Detector::Impl {
     rknn_context ctx = 0;
     rknn_tensor_attr input;
@@ -79,16 +92,143 @@ struct YoloV8Detector::Impl {
     bool pass_through = false;
     bool zero_copy = false;
     bool layout_warned = false;
+    bool parallel = false;
+    bool parallel_logged = false;
     std::vector<float> anchors;
+    SideContext side;
 
     Impl() { std::memset(&input, 0, sizeof(input)); }
 };
+
+Status query_side_io(rknn_context ctx, int width, int height, SideContext* side) {
+    rknn_input_output_num io;
+    std::memset(&io, 0, sizeof(io));
+    if (rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io)) != RKNN_SUCC || io.n_input < 1 || io.n_output < 1) {
+        return Status::Fail("second context input/output count failed");
+    }
+    side->input.index = 0;
+    if (rknn_query(ctx, RKNN_QUERY_INPUT_ATTR, &side->input, sizeof(side->input)) != RKNN_SUCC) {
+        return Status::Fail("second context input attr failed");
+    }
+    if (!input_matches(side->input, width, height)) {
+        return Status::Fail("second context input shape does not match the model");
+    }
+    const uint32_t rgb_bytes = static_cast<uint32_t>(width) * static_cast<uint32_t>(height) * 3u;
+    side->pass_through = side->input.type == RKNN_TENSOR_UINT8 && side->input.fmt == RKNN_TENSOR_NHWC &&
+                         side->input.size == rgb_bytes;
+    side->outputs.resize(io.n_output);
+    side->host.resize(io.n_output);
+    for (uint32_t i = 0; i < io.n_output; ++i) {
+        rknn_tensor_attr attr;
+        std::memset(&attr, 0, sizeof(attr));
+        attr.index = i;
+        if (rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &attr, sizeof(attr)) != RKNN_SUCC) {
+            return Status::Fail("second context output attr failed");
+        }
+        side->outputs[i] = attr;
+        side->host[i].assign(attr.n_elems, 0.f);
+    }
+    return Status::Ok();
+}
+
+Status execute_context(const AppConfig& config, const std::vector<float>& anchors, rknn_context ctx, bool pass_through,
+                       bool zero_copy, const std::vector<rknn_tensor_attr>& outputs,
+                       std::vector<std::vector<float>>& host, const PreprocessResult& input,
+                       std::vector<Detection>* dets) {
+    if (ctx == 0) {
+        return Status::Fail("detector is not initialized");
+    }
+    if (input.bytes == 0 || (input.rgb == nullptr && !zero_copy)) {
+        return Status::Fail("empty preprocess buffer");
+    }
+    int ret = RKNN_SUCC;
+    if (!zero_copy) {
+        rknn_input feed;
+        std::memset(&feed, 0, sizeof(feed));
+        feed.index = 0;
+        feed.buf = const_cast<std::uint8_t*>(input.rgb);
+        feed.size = static_cast<uint32_t>(input.bytes);
+        if (pass_through) {
+            feed.pass_through = 1;
+        } else {
+            feed.pass_through = 0;
+            feed.type = RKNN_TENSOR_UINT8;
+            feed.fmt = RKNN_TENSOR_NHWC;
+        }
+        ret = rknn_inputs_set(ctx, 1, &feed);
+        if (ret != RKNN_SUCC) {
+            return Status::Fail("rknn_inputs_set failed: " + std::to_string(ret));
+        }
+    }
+    ret = rknn_run(ctx, nullptr);
+    if (ret != RKNN_SUCC) {
+        return Status::Fail("rknn_run failed: " + std::to_string(ret));
+    }
+
+    std::vector<rknn_output> fetched(outputs.size());
+    for (std::size_t i = 0; i < fetched.size(); ++i) {
+        std::memset(&fetched[i], 0, sizeof(fetched[i]));
+        fetched[i].want_float = 1;
+        fetched[i].is_prealloc = 1;
+        fetched[i].index = static_cast<uint32_t>(i);
+        fetched[i].buf = host[i].data();
+        fetched[i].size = static_cast<uint32_t>(host[i].size() * sizeof(float));
+    }
+    ret = rknn_outputs_get(ctx, static_cast<uint32_t>(fetched.size()), fetched.data(), nullptr);
+    if (ret != RKNN_SUCC) {
+        return Status::Fail("rknn_outputs_get failed: " + std::to_string(ret));
+    }
+
+    std::vector<RawTensor> tensors(outputs.size());
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        const rknn_tensor_attr& attr = outputs[i];
+        tensors[i].channel_last = attr.fmt == RKNN_TENSOR_NHWC;
+        tensors[i].data = host[i].data();
+        tensors[i].n_elems = attr.n_elems;
+        tensors[i].dims.reserve(attr.n_dims);
+        for (uint32_t d = 0; d < attr.n_dims; ++d) {
+            tensors[i].dims.push_back(static_cast<int>(attr.dims[d]));
+        }
+    }
+
+    DecodeParams params;
+    params.num_classes = config.num_classes;
+    params.conf_threshold = config.conf_threshold;
+    params.nms_threshold = config.nms_threshold;
+    params.max_detections = config.max_detections;
+    params.anchor_scores_are_probabilities = config.anchor_scores_are_probabilities;
+    params.dfl_scores_are_logits = config.dfl_scores_are_logits;
+    params.anchors = anchors;
+    params.letterbox = input.meta;
+    DecodeResult decoded;
+    if (config.model_type == "yolov3") {
+        decoded = decode_yolov3(tensors, params);
+    } else if (config.model_type == "yolov5") {
+        decoded = decode_yolov5(tensors, params);
+    } else {
+        decoded = decode_yolov8(tensors, params);
+    }
+    rknn_outputs_release(ctx, static_cast<uint32_t>(fetched.size()), fetched.data());
+    if (!decoded.layout_recognized) {
+        return Status::Fail("unrecognized yolo output layout");
+    }
+    *dets = std::move(decoded.detections);
+    return Status::Ok();
+}
 
 YoloV8Detector::YoloV8Detector(const AppConfig& config) : config_(config), impl_(new Impl) {}
 
 YoloV8Detector::~YoloV8Detector() {
     if (impl_ == nullptr) {
         return;
+    }
+    if (impl_->side.ctx) {
+        if (impl_->side.input_mem) {
+            rknn_destroy_mem(impl_->side.ctx, impl_->side.input_mem);
+            impl_->side.input_mem = nullptr;
+        }
+        rknn_destroy(impl_->side.ctx);
+        impl_->side.ctx = 0;
     }
     if (impl_->ctx) {
         if (impl_->input_mem) {
@@ -121,12 +261,24 @@ Status YoloV8Detector::init() {
                             " (model must be converted for rk3588 with RKNN-Toolkit2)");
     }
 
-    const rknn_core_mask cores = core_mask_from_config(config_.npu_cores);
-    const int core_ret = rknn_set_core_mask(impl_->ctx, cores);
-    if (core_ret != RKNN_SUCC) {
-        YR_LOGW("rknn_set_core_mask %s -> %d", config_.npu_cores.c_str(), core_ret);
+    const bool parallel = config_.batch_size == 2 && config_.preprocess == "short_side";
+    if (config_.batch_size == 2 && !parallel) {
+        YR_LOGW("batch_size=2 is ignored unless preprocess=short_side; using one NPU context");
+    }
+    if (parallel) {
+        const int core_ret = rknn_set_core_mask(impl_->ctx, RKNN_NPU_CORE_0);
+        if (core_ret != RKNN_SUCC) {
+            return Status::Fail("rknn_set_core_mask core0 failed: " + std::to_string(core_ret));
+        }
+        YR_LOGI("parallel batch=2: context0 on NPU core0");
     } else {
-        YR_LOGI("rknn cores=%s", config_.npu_cores.c_str());
+        const rknn_core_mask cores = core_mask_from_config(config_.npu_cores);
+        const int core_ret = rknn_set_core_mask(impl_->ctx, cores);
+        if (core_ret != RKNN_SUCC) {
+            YR_LOGW("rknn_set_core_mask %s -> %d", config_.npu_cores.c_str(), core_ret);
+        } else {
+            YR_LOGI("rknn cores=%s", config_.npu_cores.c_str());
+        }
     }
 
     rknn_sdk_version ver;
@@ -240,136 +392,147 @@ Status YoloV8Detector::init() {
         }
     }
     YR_LOGI("model_type=%s", config_.model_type.c_str());
+    if (!parallel) {
+        return Status::Ok();
+    }
+
+    int dup = rknn_dup_context(&impl_->ctx, &impl_->side.ctx);
+    if (dup != RKNN_SUCC) {
+        YR_LOGW("rknn_dup_context -> %d, loading the model into a second context", dup);
+        impl_->side.ctx = 0;
+        dup = rknn_init(&impl_->side.ctx, model.data(), static_cast<uint32_t>(model.size()), RKNN_FLAG_PRIOR_HIGH,
+                        nullptr);
+    }
+    if (dup != RKNN_SUCC || impl_->side.ctx == 0) {
+        return Status::Fail("second rknn context failed: " + std::to_string(dup));
+    }
+    const int side_core = rknn_set_core_mask(impl_->side.ctx, RKNN_NPU_CORE_1);
+    if (side_core != RKNN_SUCC) {
+        return Status::Fail("rknn_set_core_mask core1 failed: " + std::to_string(side_core));
+    }
+    Status side_io = query_side_io(impl_->side.ctx, config_.model_width, config_.model_height, &impl_->side);
+    if (!side_io.ok()) {
+        return side_io;
+    }
+    if (impl_->side.outputs.size() != impl_->outputs.size()) {
+        return Status::Fail("second context output count does not match");
+    }
+    for (std::size_t i = 0; i < impl_->outputs.size(); ++i) {
+        if (impl_->side.outputs[i].n_elems != impl_->outputs[i].n_elems) {
+            return Status::Fail("second context output shape does not match");
+        }
+    }
+    impl_->parallel = true;
+    YR_LOGI("parallel batch=2 ready on NPU core0+core1, model file stays batch 1");
     return Status::Ok();
 }
 
-void YoloV8Detector::bind_input(int fd, void* virt, std::size_t bytes) {
-    if (impl_->ctx == 0 || impl_->zero_copy || fd < 0 || virt == nullptr) {
+void bind_one(rknn_context ctx, rknn_tensor_attr input_attr, bool pass_through, int width, int height, int fd,
+              void* virt, std::size_t bytes, rknn_tensor_mem** mem_out, bool* zero_copy, int tile) {
+    if (ctx == 0 || *zero_copy || fd < 0 || virt == nullptr) {
         return;
     }
-    const std::size_t packed =
-        static_cast<std::size_t>(config_.model_width) * static_cast<std::size_t>(config_.model_height) * 3u;
+    const std::size_t packed = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u;
     if (bytes < packed) {
         YR_LOGW("preprocess buffer %zu is smaller than RGB888 %zu, keep rknn_inputs_set", bytes, packed);
         return;
     }
-
-    rknn_tensor_mem* mem = rknn_create_mem_from_fd(impl_->ctx, fd, virt, static_cast<uint32_t>(bytes), 0);
+    rknn_tensor_mem* mem = rknn_create_mem_from_fd(ctx, fd, virt, static_cast<uint32_t>(bytes), 0);
     if (mem == nullptr) {
         YR_LOGW("rknn_create_mem_from_fd failed, keep rknn_inputs_set");
         return;
     }
-
-    rknn_tensor_attr attr = impl_->input;
-    const bool tight_stride = (attr.w_stride == 0 || attr.w_stride == static_cast<uint32_t>(config_.model_width)) &&
-                              (attr.h_stride == 0 || attr.h_stride == static_cast<uint32_t>(config_.model_height));
-    if (impl_->pass_through && tight_stride) {
+    rknn_tensor_attr attr = input_attr;
+    const bool tight_stride = (attr.w_stride == 0 || attr.w_stride == static_cast<uint32_t>(width)) &&
+                              (attr.h_stride == 0 || attr.h_stride == static_cast<uint32_t>(height));
+    if (pass_through && tight_stride) {
         attr.pass_through = 1;
     } else {
-        // 驱动按 UINT8 NHWC 读这块 dma-buf，再转成模型内部布局。转换不经过用户态拷贝。
         attr.pass_through = 0;
         attr.type = RKNN_TENSOR_UINT8;
         attr.fmt = RKNN_TENSOR_NHWC;
     }
-    const int ret = rknn_set_io_mem(impl_->ctx, mem, &attr);
+    const int ret = rknn_set_io_mem(ctx, mem, &attr);
     if (ret != RKNN_SUCC) {
         YR_LOGW("rknn_set_io_mem failed: %d, keep rknn_inputs_set", ret);
-        rknn_destroy_mem(impl_->ctx, mem);
+        rknn_destroy_mem(ctx, mem);
         return;
     }
-    impl_->input_mem = mem;
-    impl_->zero_copy = true;
-    YR_LOGI("rknn input zero-copy fd=%d pass_through=%u bytes=%zu", fd, attr.pass_through, bytes);
+    *mem_out = mem;
+    *zero_copy = true;
+    YR_LOGI("rknn input zero-copy tile=%d fd=%d pass_through=%u bytes=%zu", tile, fd, attr.pass_through, bytes);
+}
+
+void YoloV8Detector::bind_input(int fd, void* virt, std::size_t bytes) { bind_input(0, fd, virt, bytes); }
+
+void YoloV8Detector::bind_input(int tile, int fd, void* virt, std::size_t bytes) {
+    if (tile == 0) {
+        bind_one(impl_->ctx, impl_->input, impl_->pass_through, config_.model_width, config_.model_height, fd, virt,
+                 bytes, &impl_->input_mem, &impl_->zero_copy, 0);
+        return;
+    }
+    if (tile == 1 && impl_->parallel) {
+        bind_one(impl_->side.ctx, impl_->side.input, impl_->side.pass_through, config_.model_width,
+                 config_.model_height, fd, virt, bytes, &impl_->side.input_mem, &impl_->side.zero_copy, 1);
+    }
 }
 
 Status YoloV8Detector::infer(const PreprocessResult& input, InferenceResult& result) {
-    if (impl_->ctx == 0) {
-        return Status::Fail("detector is not initialized");
-    }
-    if (input.bytes == 0 || (input.rgb == nullptr && !impl_->zero_copy)) {
-        return Status::Fail("empty preprocess buffer");
-    }
+    return infer(&input, 1, result);
+}
 
+Status YoloV8Detector::infer(const PreprocessResult* tiles, int tile_count, InferenceResult& result) {
+    if (tiles == nullptr || tile_count < 1) {
+        return Status::Fail("empty preprocess batch");
+    }
     const auto t0 = std::chrono::steady_clock::now();
-    int ret = RKNN_SUCC;
-    if (!impl_->zero_copy) {
-        rknn_input feed;
-        std::memset(&feed, 0, sizeof(feed));
-        feed.index = 0;
-        feed.buf = const_cast<std::uint8_t*>(input.rgb);
-        feed.size = static_cast<uint32_t>(input.bytes);
-        if (impl_->pass_through) {
-            feed.pass_through = 1;
-        } else {
-            feed.pass_through = 0;
-            feed.type = RKNN_TENSOR_UINT8;
-            feed.fmt = RKNN_TENSOR_NHWC;
-        }
-        ret = rknn_inputs_set(impl_->ctx, 1, &feed);
-        if (ret != RKNN_SUCC) {
-            return Status::Fail("rknn_inputs_set failed: " + std::to_string(ret));
-        }
-    }
-    ret = rknn_run(impl_->ctx, nullptr);
-    if (ret != RKNN_SUCC) {
-        return Status::Fail("rknn_run failed: " + std::to_string(ret));
-    }
-
-    std::vector<rknn_output> fetched(impl_->outputs.size());
-    for (std::size_t i = 0; i < fetched.size(); ++i) {
-        std::memset(&fetched[i], 0, sizeof(fetched[i]));
-        fetched[i].want_float = 1;
-        fetched[i].is_prealloc = 1;
-        fetched[i].index = static_cast<uint32_t>(i);
-        fetched[i].buf = impl_->host[i].data();
-        fetched[i].size = static_cast<uint32_t>(impl_->host[i].size() * sizeof(float));
-    }
-    ret = rknn_outputs_get(impl_->ctx, static_cast<uint32_t>(fetched.size()), fetched.data(), nullptr);
-    if (ret != RKNN_SUCC) {
-        return Status::Fail("rknn_outputs_get failed: " + std::to_string(ret));
-    }
-
-    std::vector<RawTensor> tensors(impl_->outputs.size());
-    for (std::size_t i = 0; i < tensors.size(); ++i) {
-        const rknn_tensor_attr& attr = impl_->outputs[i];
-        tensors[i].channel_last = attr.fmt == RKNN_TENSOR_NHWC;
-        tensors[i].data = impl_->host[i].data();
-        tensors[i].n_elems = attr.n_elems;
-        tensors[i].dims.reserve(attr.n_dims);
-        for (uint32_t d = 0; d < attr.n_dims; ++d) {
-            tensors[i].dims.push_back(static_cast<int>(attr.dims[d]));
-        }
-    }
-
-    DecodeParams params;
-    params.num_classes = config_.num_classes;
-    params.conf_threshold = config_.conf_threshold;
-    params.nms_threshold = config_.nms_threshold;
-    params.max_detections = config_.max_detections;
-    params.anchor_scores_are_probabilities = config_.anchor_scores_are_probabilities;
-    params.dfl_scores_are_logits = config_.dfl_scores_are_logits;
-    params.anchors = impl_->anchors;
-    params.letterbox = input.meta;
-    DecodeResult decoded;
-    if (config_.model_type == "yolov3") {
-        decoded = decode_yolov3(tensors, params);
-    } else if (config_.model_type == "yolov5") {
-        decoded = decode_yolov5(tensors, params);
+    std::vector<Detection> left;
+    std::vector<Detection> right;
+    Status left_st = Status::Ok();
+    Status right_st = Status::Ok();
+    if (tile_count >= 2 && impl_->parallel) {
+        std::thread core0([&] {
+            left_st = execute_context(config_, impl_->anchors, impl_->ctx, impl_->pass_through, impl_->zero_copy,
+                                      impl_->outputs, impl_->host, tiles[0], &left);
+        });
+        std::thread core1([&] {
+            right_st = execute_context(config_, impl_->anchors, impl_->side.ctx, impl_->side.pass_through,
+                                       impl_->side.zero_copy, impl_->side.outputs, impl_->side.host, tiles[1],
+                                       &right);
+        });
+        core0.join();
+        core1.join();
     } else {
-        decoded = decode_yolov8(tensors, params);
+        left_st = execute_context(config_, impl_->anchors, impl_->ctx, impl_->pass_through, impl_->zero_copy,
+                                  impl_->outputs, impl_->host, tiles[0], &left);
     }
-    rknn_outputs_release(impl_->ctx, static_cast<uint32_t>(fetched.size()), fetched.data());
-
     const auto t1 = std::chrono::steady_clock::now();
     result.infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    if (!decoded.layout_recognized) {
-        if (!impl_->layout_warned) {
+    if (!left_st.ok()) {
+        if (left_st.message() == "unrecognized yolo output layout" && !impl_->layout_warned) {
             YR_LOGE("YOLO output layout does not match model_type=%s", config_.model_type.c_str());
             impl_->layout_warned = true;
         }
-        return Status::Fail("unrecognized yolo output layout");
+        return left_st;
     }
-    result.detections = decoded.detections;
+    if (!right_st.ok()) {
+        if (right_st.message() == "unrecognized yolo output layout" && !impl_->layout_warned) {
+            YR_LOGE("YOLO output layout does not match model_type=%s", config_.model_type.c_str());
+            impl_->layout_warned = true;
+        }
+        return right_st;
+    }
+    if (tile_count >= 2 && impl_->parallel) {
+        left.insert(left.end(), right.begin(), right.end());
+        result.detections =
+            suppress_overlaps(std::move(left), config_.nms_threshold, config_.max_detections);
+        if (!impl_->parallel_logged) {
+            YR_LOGI("parallel batch=2 infer %.1f ms dets=%zu", result.infer_ms, result.detections.size());
+            impl_->parallel_logged = true;
+        }
+    } else {
+        result.detections = std::move(left);
+    }
     return Status::Ok();
 }
 

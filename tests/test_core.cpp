@@ -249,6 +249,82 @@ void test_yolov5_split_dfl() {
     }
 }
 
+void test_input_fit() {
+    yolo_rknn::ModelWindow window;
+    expect(yolo_rknn::plan_model_window(yolo_rknn::InputFit::ShortSide, 1920, 1080, 640, 640, &window),
+           "short side plan");
+    expect(window.src_x == 420 && window.src_y == 0, "short side origin");
+    expect(window.src_w == 1080 && window.src_h == 1080, "short side keeps the 1080 square");
+    expect(window.dst_w == 640 && window.dst_h == 640 && window.dst_x == 0, "short side fills the model");
+    expect(!window.fill, "short side has no gray bar");
+    const float x0 = (0.f - window.meta.pad_x) / window.meta.scale;
+    const float x1 = (640.f - window.meta.pad_x) / window.meta.scale;
+    const float y1 = (640.f - window.meta.pad_y) / window.meta.scale;
+    expect_near(x0, 420.f, 0.05f, "model left is source x=420");
+    expect_near(x1, 1500.f, 0.05f, "model right is source x=1500");
+    expect_near(y1, 1080.f, 0.05f, "model bottom is source y=1080");
+
+    expect(yolo_rknn::plan_model_window(yolo_rknn::InputFit::ShortSide, 1080, 1920, 640, 640, &window),
+           "portrait plan");
+    expect(window.src_x == 0 && window.src_y == 420, "portrait crops the long side");
+    expect(window.src_w == 1080 && window.src_h == 1080, "portrait window");
+
+    expect(yolo_rknn::plan_model_window(yolo_rknn::InputFit::ShortSide, 1920, 1080, 640, 640, &window,
+                                       yolo_rknn::WindowAnchor::Start),
+           "left edge plan");
+    expect(window.src_x == 0 && window.src_y == 0 && window.src_w == 1080 && window.src_h == 1080, "left window");
+    expect_near((0.f - window.meta.pad_x) / window.meta.scale, 0.f, 0.05f, "left edge is source x=0");
+    expect_near((640.f - window.meta.pad_x) / window.meta.scale, 1080.f, 0.05f, "left tile ends at x=1080");
+
+    expect(yolo_rknn::plan_model_window(yolo_rknn::InputFit::ShortSide, 1920, 1080, 640, 640, &window,
+                                       yolo_rknn::WindowAnchor::End),
+           "right edge plan");
+    expect(window.src_x == 840 && window.src_w == 1080 && window.src_h == 1080, "right window");
+    expect_near((0.f - window.meta.pad_x) / window.meta.scale, 840.f, 0.05f, "right edge starts at x=840");
+    expect_near((640.f - window.meta.pad_x) / window.meta.scale, 1920.f, 0.05f, "right edge is source x=1920");
+
+    expect(yolo_rknn::plan_model_window(yolo_rknn::InputFit::Letterbox, 1920, 1080, 640, 640, &window),
+           "letterbox plan");
+    expect(window.src_x == 0 && window.src_w == 1920 && window.src_h == 1080, "letterbox uses the full frame");
+    expect(window.fill, "letterbox fills gray");
+    expect(window.dst_w == 640 && window.dst_y > 0, "letterbox pads the short side");
+    expect_near(window.meta.pad_y, static_cast<float>(window.dst_y), 0.01f, "letterbox pad matches the gray bar");
+}
+
+void test_tile_duplicate() {
+    yolo_rknn::Detection full;
+    full.x = 1000.f;
+    full.y = 200.f;
+    full.w = 160.f;
+    full.h = 200.f;
+    full.score = 0.70f;
+    full.class_id = 0;
+    yolo_rknn::Detection clipped;
+    clipped.x = 1010.f;
+    clipped.y = 210.f;
+    clipped.w = 70.f;
+    clipped.h = 170.f;
+    clipped.score = 0.92f;
+    clipped.class_id = 0;
+    yolo_rknn::Detection neighbor;
+    neighbor.x = 1300.f;
+    neighbor.y = 200.f;
+    neighbor.w = 70.f;
+    neighbor.h = 180.f;
+    neighbor.score = 0.80f;
+    neighbor.class_id = 0;
+
+    const std::vector<yolo_rknn::Detection> kept =
+        yolo_rknn::suppress_overlaps({clipped, full, neighbor}, 0.45f, 10);
+    expect(kept.size() == 2, "clipped duplicate is merged, neighbor stays");
+    if (kept.size() == 2) {
+        const yolo_rknn::Detection* wide = kept[0].w > kept[1].w ? &kept[0] : &kept[1];
+        const yolo_rknn::Detection* other = wide == &kept[0] ? &kept[1] : &kept[0];
+        expect_near(wide->w, 160.f, 0.1f, "keep the unclipped box");
+        expect_near(other->x, 1300.f, 0.1f, "side-by-side target stays");
+    }
+}
+
 void test_zoom() {
     yolo_rknn::ZoomInput in;
     in.has_target = false;
@@ -312,6 +388,8 @@ int main() {
     test_unknown_layout();
     test_yolov3_head();
     test_yolov5_split_dfl();
+    test_input_fit();
+    test_tile_duplicate();
     test_zoom();
     test_osd_stroke();
     if (g_failed != 0) {

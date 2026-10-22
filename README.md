@@ -10,7 +10,8 @@
 RTSP/文件 --TCP，小缓冲--> FFmpeg 解封装（只拆包，不解码）
         --Annex-B--> VPU / MPP 硬解 --> NV12，DRM 物理连续内存
         --队列深度 2，满了丢旧帧--> RGA2/RGA3 缩放 + 填边 + NV12 转 RGB
-        --同一张 dma-buf fd--> RKNN2 NPU（三核）--> 后处理 NMS
+        --同一张 dma-buf fd--> RKNN2 NPU --> 后处理 NMS
+        batch_size=2 且 short_side：左右两张同时跑，core0 和 core1
         --> 业务线程：高度、变焦、VISCA
         --> 显示线程（可选）：同一张 NV12 进视频层，检测框进 OSD 层
 ```
@@ -43,6 +44,7 @@ testdata/               1080p H.264 样片
 docs/                   设计说明
 models/                 放 rk3588 的 .rknn，不进版本库
 scripts/build.sh
+scripts/npu_load.sh       实时看三颗 NPU 核的占用
 ```
 
 ## 编译和试跑
@@ -57,7 +59,7 @@ scripts/build.sh
 ./build/bin/yolo_rknn --config config/app.conf --url rtsp://192.168.1.64/live --model weights/yolov5_rk3588_int8.rknn
 ```
 
-`Ctrl+C` 结束。文件播完会自己退出。
+`Ctrl+C` 结束。文件播完会自己退出。看三颗 NPU 核的占用：`./scripts/npu_load.sh`（debugfs 要 root，脚本会自己要 sudo）。
 
 默认 `display_enable=false`。本机 HDMI-A-1、HDMI-A-2、DP-1 都没接上。接上显示器后再把 `config/app.conf` 里的这一项改成 `true`。显示节点是 `/dev/dri/card0`，`card1` 是 NPU。
 

@@ -104,8 +104,8 @@ int main(int argc, char** argv) {
 
     const std::string board = device_model();
     YR_LOGI("yolo_rknn %s device=%s", YR_VERSION, board.empty() ? "unknown" : board.c_str());
-    YR_LOGI("url=%s model=%s type=%s decode_only=%d", cfg.url.c_str(), cfg.model_path.c_str(), cfg.model_type.c_str(),
-            cfg.decode_only ? 1 : 0);
+    YR_LOGI("url=%s model=%s type=%s preprocess=%s batch=%d decode_only=%d", cfg.url.c_str(), cfg.model_path.c_str(),
+            cfg.model_type.c_str(), cfg.preprocess.c_str(), cfg.batch_size, cfg.decode_only ? 1 : 0);
 
     yolo_rknn::Pipeline pipeline(cfg);
     g_pipeline = &pipeline;

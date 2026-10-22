@@ -116,6 +116,11 @@ Status assign(AppConfig* cfg, const std::string& key, const std::string& value, 
         if (!parse_int(value, &cfg->model_width)) return bad("expect int");
     } else if (key == "model_height") {
         if (!parse_int(value, &cfg->model_height)) return bad("expect int");
+    } else if (key == "preprocess") {
+        if (value != "letterbox" && value != "short_side") return bad("expect letterbox or short_side");
+        cfg->preprocess = value;
+    } else if (key == "batch_size") {
+        if (!parse_int(value, &cfg->batch_size)) return bad("expect int");
     } else if (key == "conf_threshold") {
         if (!parse_float(value, &cfg->conf_threshold)) return bad("expect float");
     } else if (key == "nms_threshold") {
@@ -257,6 +262,9 @@ Status AppConfig::validate() const {
     }
     if (num_classes <= 0 || max_detections <= 0 || queue_depth < 1 || decoder_buf_count < 4) {
         return Status::Fail("num_classes, max_detections, queue_depth or decoder_buf_count is invalid");
+    }
+    if (batch_size != 1 && batch_size != 2) {
+        return Status::Fail("batch_size must be 1 or 2");
     }
     if (!priority_ok(stream_priority) || !priority_ok(infer_priority) || !priority_ok(business_priority) ||
         !priority_ok(display_priority)) {
