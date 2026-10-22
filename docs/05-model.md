@@ -25,12 +25,23 @@ Toolkit 1.x 的产物（RK3399Pro）和其他平台的 Toolkit2 模型都不兼�
 
 | `model_type` | 典型输入 | 输出 |
 | --- | --- | --- |
-| `yolov8` | 640x640 | 一张 `[1, 4+nc, N]`，或三个 DFL 头 |
+| `yolov5` | 640x640 | 三个尺度的 64 通道 DFL 框加 nc 通道分数，或三个 `3*(5+nc)` 锚点头 |
+| `yolov8` | 640x640 | 一张 `[1, 4+nc, N]`，或三个合并的 DFL 头 |
 | `yolov3` | 416x416 | YOLOv3-tiny 两个头，或完整 YOLOv3 三个头 |
 
 `model_width` / `model_height` 必须和 `rknn_query` 看到的输入一致。对不上时初始化失败，日志里同时有配置尺寸和张量 shape。
 
-换模型时改 `config/app.conf` 里的 `model_type`、`model_path`、`model_width`、`model_height`。YOLOv3 还要看 `anchors`。
+换模型时改 `config/app.conf` 里的 `model_type`、`model_path`、`model_width`、`model_height`。锚点头还要看 `anchors`。
+
+当前默认模型是 `weights/yolov5_rk3588_int8.rknn`。输入是 uint8 NHWC 640x640，内部量化成 int8，`scale=1/255`、`zp=-128`，所以 RGA 的 RGB888 用 `pass_through=0` 送进去。输出是 9 张 NCHW 图，三个尺度各一组：
+
+| 尺度 | 框 | 分数 |
+| --- | --- | --- |
+| 80x80，stride 8 | `[1, 64, 80, 80]` | 两张 `[1, 1, 80, 80]`，用后面那张 |
+| 40x40，stride 16 | `[1, 64, 40, 40]` | 两张 `[1, 1, 40, 40]`，用后面那张 |
+| 20x20，stride 32 | `[1, 64, 20, 20]` | 两张 `[1, 1, 20, 20]`，用后面那张 |
+
+64 通道是 4 边 × 16 个 DFL bin。分数已经在 0–1，`dfl_scores_are_logits=false`，`num_classes=1`。前面那张同尺寸分数是导出时留下的 Sigmoid，解码不用它。
 
 ## YOLOv8 的两种输出布局
 

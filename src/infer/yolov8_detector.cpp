@@ -206,6 +206,38 @@ Status YoloV8Detector::init() {
                                 " pairs, model has " + std::to_string(impl_->outputs.size()) +
                                 " heads, need 3 anchors per head");
         }
+    } else if (config_.model_type == "yolov5") {
+        std::vector<RawTensor> shapes(impl_->outputs.size());
+        for (std::size_t i = 0; i < impl_->outputs.size(); ++i) {
+            const rknn_tensor_attr& attr = impl_->outputs[i];
+            shapes[i].channel_last = attr.fmt == RKNN_TENSOR_NHWC;
+            shapes[i].n_elems = attr.n_elems;
+            for (uint32_t d = 0; d < attr.n_dims; ++d) {
+                shapes[i].dims.push_back(static_cast<int>(attr.dims[d]));
+            }
+        }
+        if (yolov5_split_dfl_recognized(shapes, config_.num_classes, config_.model_width, config_.model_height)) {
+            YR_LOGI("yolov5 split DFL heads, classes=%d", config_.num_classes);
+        } else if (yolov3_outputs_recognized(shapes, config_.num_classes, config_.model_width,
+                                             config_.model_height)) {
+            if (config_.anchors.empty()) {
+                // COCO YOLOv5，stride 从大到小：32、16、8，每个 stride 三个 anchor。
+                const float coco[] = {116.f, 90.f, 156.f, 198.f, 373.f, 326.f, 30.f, 61.f, 62.f,
+                                      45.f,  59.f, 119.f, 10.f,  13.f,  16.f,  30.f, 33.f, 23.f};
+                impl_->anchors.assign(coco, coco + 18);
+                YR_LOGI("yolov5 using built-in COCO anchors");
+            } else {
+                impl_->anchors = config_.anchors;
+            }
+            if (impl_->anchors.size() != impl_->outputs.size() * 6) {
+                return Status::Fail("anchors has " + std::to_string(impl_->anchors.size() / 2) +
+                                    " pairs, model has " + std::to_string(impl_->outputs.size()) +
+                                    " heads, need 3 anchors per head");
+            }
+        } else {
+            return Status::Fail(
+                "model_type=yolov5 but outputs are neither split DFL maps nor 3-anchor heads");
+        }
     }
     YR_LOGI("model_type=%s", config_.model_type.c_str());
     return Status::Ok();
@@ -318,8 +350,14 @@ Status YoloV8Detector::infer(const PreprocessResult& input, InferenceResult& res
     params.dfl_scores_are_logits = config_.dfl_scores_are_logits;
     params.anchors = impl_->anchors;
     params.letterbox = input.meta;
-    const DecodeResult decoded =
-        config_.model_type == "yolov3" ? decode_yolov3(tensors, params) : decode_yolov8(tensors, params);
+    DecodeResult decoded;
+    if (config_.model_type == "yolov3") {
+        decoded = decode_yolov3(tensors, params);
+    } else if (config_.model_type == "yolov5") {
+        decoded = decode_yolov5(tensors, params);
+    } else {
+        decoded = decode_yolov8(tensors, params);
+    }
     rknn_outputs_release(impl_->ctx, static_cast<uint32_t>(fetched.size()), fetched.data());
 
     const auto t1 = std::chrono::steady_clock::now();

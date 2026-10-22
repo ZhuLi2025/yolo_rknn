@@ -24,8 +24,9 @@ struct AppConfig {
     int analyze_duration_us = 100000;
 
     // ---- 模型 ----
-    // yolov8：单输出锚点头，或三个 DFL 头。yolov3：darknet 的多尺度 anchor 头，tiny 是 2 个，完整版是 3 个。
-    std::string model_type = "yolov8";
+    // yolov8：单输出锚点头，或三个 DFL 头。
+    // yolov5：拆开的 DFL 头，或经典 3 个 anchor 头。yolov3：darknet 多尺度 anchor 头。
+    std::string model_type = "yolov5";
     std::string model_path;
     // RK3588 三核 NPU。取值 auto / 0 / 1 / 2 / 0_1 / 0_1_2。
     std::string npu_cores = "0_1_2";

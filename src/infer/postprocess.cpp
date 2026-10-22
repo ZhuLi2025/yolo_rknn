@@ -339,8 +339,8 @@ float yolov3_at(const float* data, const YoloV3Head& head, int channel, int y, i
     return data[(y * head.grid_w + x) * head.channels + channel];
 }
 
-void decode_yolov3_head(const RawTensor& tensor, const YoloV3Head& head, const float* anchor_wh,
-                        const DecodeParams& params, std::vector<Detection>* dets) {
+void decode_anchor_head(const RawTensor& tensor, const YoloV3Head& head, const float* anchor_wh,
+                        const DecodeParams& params, bool yolov5, std::vector<Detection>* dets) {
     if (tensor.data == nullptr) {
         return;
     }
@@ -368,14 +368,29 @@ void decode_yolov3_head(const RawTensor& tensor, const YoloV3Head& head, const f
                 if (best < params.conf_threshold || best_id < 0) {
                     continue;
                 }
-                const float tx = sigmoid(yolov3_at(tensor.data, head, base + 0, y, x));
-                const float ty = sigmoid(yolov3_at(tensor.data, head, base + 1, y, x));
-                const float tw = clampf(yolov3_at(tensor.data, head, base + 2, y, x), -16.f, 16.f);
-                const float th = clampf(yolov3_at(tensor.data, head, base + 3, y, x), -16.f, 16.f);
-                const float cx = (tx + static_cast<float>(x)) * stride;
-                const float cy = (ty + static_cast<float>(y)) * stride;
-                const float bw = std::exp(tw) * anchor_w;
-                const float bh = std::exp(th) * anchor_h;
+                float cx = 0.f;
+                float cy = 0.f;
+                float bw = 0.f;
+                float bh = 0.f;
+                if (yolov5) {
+                    const float tx = sigmoid(yolov3_at(tensor.data, head, base + 0, y, x));
+                    const float ty = sigmoid(yolov3_at(tensor.data, head, base + 1, y, x));
+                    const float tw = sigmoid(yolov3_at(tensor.data, head, base + 2, y, x));
+                    const float th = sigmoid(yolov3_at(tensor.data, head, base + 3, y, x));
+                    cx = (tx * 2.f - 0.5f + static_cast<float>(x)) * stride;
+                    cy = (ty * 2.f - 0.5f + static_cast<float>(y)) * stride;
+                    bw = (tw * 2.f) * (tw * 2.f) * anchor_w;
+                    bh = (th * 2.f) * (th * 2.f) * anchor_h;
+                } else {
+                    const float tx = sigmoid(yolov3_at(tensor.data, head, base + 0, y, x));
+                    const float ty = sigmoid(yolov3_at(tensor.data, head, base + 1, y, x));
+                    const float tw = clampf(yolov3_at(tensor.data, head, base + 2, y, x), -16.f, 16.f);
+                    const float th = clampf(yolov3_at(tensor.data, head, base + 3, y, x), -16.f, 16.f);
+                    cx = (tx + static_cast<float>(x)) * stride;
+                    cy = (ty + static_cast<float>(y)) * stride;
+                    bw = std::exp(tw) * anchor_w;
+                    bh = std::exp(th) * anchor_h;
+                }
                 Detection det;
                 det.score = best;
                 det.class_id = best_id;
@@ -383,6 +398,148 @@ void decode_yolov3_head(const RawTensor& tensor, const YoloV3Head& head, const f
                 if (det.w >= 1.f && det.h >= 1.f) {
                     dets->push_back(det);
                 }
+            }
+        }
+    }
+}
+
+struct SplitScale {
+    int box = -1;
+    int score = -1;
+    int height = 0;
+    int width = 0;
+};
+
+bool grid_hwc(const RawTensor& tensor, int* channels, int* height, int* width) {
+    if (tensor.dims.size() != 4 || tensor.dims[0] != 1) {
+        return false;
+    }
+    if (tensor.channel_last) {
+        *height = tensor.dims[1];
+        *width = tensor.dims[2];
+        *channels = tensor.dims[3];
+    } else {
+        *channels = tensor.dims[1];
+        *height = tensor.dims[2];
+        *width = tensor.dims[3];
+    }
+    return *channels > 0 && *height > 0 && *width > 0;
+}
+
+// 同一尺度上，64 通道是 DFL 框，nc 通道是分数。导出时 Sigmoid 和 Clip 都会露出来，取最后一张分数。
+bool match_split_dfl(const std::vector<RawTensor>& tensors, int num_classes, int model_w, int model_h,
+                     std::vector<SplitScale>* scales) {
+    if (tensors.empty() || num_classes <= 0 || model_w <= 0 || model_h <= 0 || scales == nullptr) {
+        return false;
+    }
+    struct Cell {
+        int index;
+        int channels;
+        int height;
+        int width;
+    };
+    std::vector<Cell> cells;
+    std::vector<std::pair<int, int>> keys;
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        int channels = 0;
+        int height = 0;
+        int width = 0;
+        if (!grid_hwc(tensors[i], &channels, &height, &width)) {
+            return false;
+        }
+        cells.push_back(Cell{static_cast<int>(i), channels, height, width});
+        bool seen = false;
+        for (std::size_t k = 0; k < keys.size(); ++k) {
+            if (keys[k].first == height && keys[k].second == width) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            keys.push_back(std::make_pair(height, width));
+        }
+    }
+    if (keys.empty() || keys.size() > 3) {
+        return false;
+    }
+    scales->clear();
+    for (std::size_t k = 0; k < keys.size(); ++k) {
+        SplitScale scale;
+        scale.height = keys[k].first;
+        scale.width = keys[k].second;
+        int score_count = 0;
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            if (cells[i].height != scale.height || cells[i].width != scale.width) {
+                continue;
+            }
+            if (cells[i].channels == 64) {
+                if (scale.box >= 0) {
+                    return false;
+                }
+                scale.box = cells[i].index;
+            } else if (cells[i].channels == num_classes) {
+                scale.score = cells[i].index;
+                ++score_count;
+            } else {
+                return false;
+            }
+        }
+        if (scale.box < 0 || scale.score < 0 || score_count < 1) {
+            return false;
+        }
+        if (model_w % scale.width != 0 || model_h % scale.height != 0) {
+            return false;
+        }
+        if (model_w / scale.width != model_h / scale.height) {
+            return false;
+        }
+        scales->push_back(scale);
+    }
+    return !scales->empty();
+}
+
+void decode_split_scale(const RawTensor& box, const RawTensor& score, int height, int width, const DecodeParams& params,
+                        std::vector<Detection>* dets) {
+    if (box.data == nullptr || score.data == nullptr) {
+        return;
+    }
+    const int stride = params.letterbox.model_width / width;
+    const int classes = params.num_classes;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float best = -1.f;
+            int best_id = -1;
+            for (int c = 0; c < classes; ++c) {
+                float value = dfl_at(score, c, y, x, classes, height, width);
+                if (params.dfl_scores_are_logits) {
+                    value = sigmoid(value);
+                }
+                if (value > best) {
+                    best = value;
+                    best_id = c;
+                }
+            }
+            if (best < params.conf_threshold || best_id < 0) {
+                continue;
+            }
+            float dist[4];
+            for (int side = 0; side < 4; ++side) {
+                float bins[16];
+                for (int b = 0; b < 16; ++b) {
+                    bins[b] = dfl_at(box, side * 16 + b, y, x, 64, height, width);
+                }
+                dist[side] = dfl_expect(bins, 16);
+            }
+            const float cx = static_cast<float>(x) + 0.5f;
+            const float cy = static_cast<float>(y) + 0.5f;
+            const float s = static_cast<float>(stride);
+            Detection det;
+            det.score = best;
+            det.class_id = best_id;
+            map_box((cx - dist[0]) * s, (cy - dist[1]) * s, (cx + dist[2]) * s, (cy + dist[3]) * s, params.letterbox,
+                    &det);
+            if (det.w >= 1.f && det.h >= 1.f) {
+                dets->push_back(det);
             }
         }
     }
@@ -481,7 +638,67 @@ DecodeResult decode_yolov3(const std::vector<RawTensor>& tensors, const DecodePa
     std::vector<Detection> dets;
     for (std::size_t i = 0; i < heads.size(); ++i) {
         const float* anchor_wh = params.anchors.data() + i * 6;
-        decode_yolov3_head(tensors[static_cast<std::size_t>(heads[i].order)], heads[i], anchor_wh, params, &dets);
+        decode_anchor_head(tensors[static_cast<std::size_t>(heads[i].order)], heads[i], anchor_wh, params, false,
+                           &dets);
+    }
+    result.detections = nms(std::move(dets), params.nms_threshold, params.max_detections);
+    return result;
+}
+
+bool yolov5_split_dfl_recognized(const std::vector<RawTensor>& tensors, int num_classes, int model_width,
+                                 int model_height) {
+    std::vector<SplitScale> scales;
+    return match_split_dfl(tensors, num_classes, model_width, model_height, &scales);
+}
+
+bool yolov5_outputs_recognized(const std::vector<RawTensor>& tensors, int num_classes, int model_width,
+                               int model_height) {
+    if (yolov5_split_dfl_recognized(tensors, num_classes, model_width, model_height)) {
+        return true;
+    }
+    return yolov3_outputs_recognized(tensors, num_classes, model_width, model_height);
+}
+
+DecodeResult decode_yolov5(const std::vector<RawTensor>& tensors, const DecodeParams& params) {
+    DecodeResult result;
+    std::vector<SplitScale> scales;
+    if (match_split_dfl(tensors, params.num_classes, params.letterbox.model_width, params.letterbox.model_height,
+                        &scales)) {
+        result.layout_recognized = true;
+        std::vector<Detection> dets;
+        for (std::size_t i = 0; i < scales.size(); ++i) {
+            const SplitScale& scale = scales[i];
+            decode_split_scale(tensors[static_cast<std::size_t>(scale.box)],
+                               tensors[static_cast<std::size_t>(scale.score)], scale.height, scale.width, params,
+                               &dets);
+        }
+        result.detections = nms(std::move(dets), params.nms_threshold, params.max_detections);
+        return result;
+    }
+
+    if (params.anchors.size() != tensors.size() * 6) {
+        return result;
+    }
+    std::vector<YoloV3Head> heads(tensors.size());
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (!view_yolov3_head(tensors[i], params.num_classes, params.letterbox.model_width,
+                              params.letterbox.model_height, &heads[i])) {
+            return result;
+        }
+        heads[i].order = static_cast<int>(i);
+    }
+    std::sort(heads.begin(), heads.end(), [](const YoloV3Head& a, const YoloV3Head& b) {
+        if (a.stride != b.stride) {
+            return a.stride > b.stride;
+        }
+        return a.order < b.order;
+    });
+    result.layout_recognized = true;
+    std::vector<Detection> dets;
+    for (std::size_t i = 0; i < heads.size(); ++i) {
+        const float* anchor_wh = params.anchors.data() + i * 6;
+        decode_anchor_head(tensors[static_cast<std::size_t>(heads[i].order)], heads[i], anchor_wh, params, true,
+                           &dets);
     }
     result.detections = nms(std::move(dets), params.nms_threshold, params.max_detections);
     return result;

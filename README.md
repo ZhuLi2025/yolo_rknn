@@ -54,7 +54,7 @@ scripts/build.sh
 # 不加载模型，用样片把硬解和 RGA 跑一遍
 ./build/bin/yolo_rknn --url testdata/sample_1080p.mp4 --decode-only
 # 正式推理。模型必须是 RKNN-Toolkit2、target_platform=rk3588
-./build/bin/yolo_rknn --config config/app.conf --url rtsp://192.168.1.64/live --model models/yolov8n_rk3588.rknn
+./build/bin/yolo_rknn --config config/app.conf --url rtsp://192.168.1.64/live --model weights/yolov5_rk3588_int8.rknn
 ```
 
 `Ctrl+C` 结束。文件播完会自己退出。
@@ -75,6 +75,7 @@ sudo setcap cap_sys_nice+ep ./build/bin/yolo_rknn
 - [线程](docs/04-threading.md)
 - [模型与后处理](docs/05-model.md)
 - [这台板子](docs/06-this-board-vs-rv1126.md)
+- [从 Windows 推 RTSP](docs/07-windows-rtsp-push.md)
 
 ## 已经在本机验证过的部分
 
@@ -82,4 +83,4 @@ sudo setcap cap_sys_nice+ep ./build/bin/yolo_rknn
 - `testdata/sample_1080p.mp4`（H.264 1920x1080，Baseline）：VPU 解出 NV12 DRM 缓冲，RGA letterbox 到 640x640 大约 2 ms，进程在文件结束后退出
 - librga 报出 RGA2 和 RGA3。NPU 驱动在 `/dev/dri/renderD129`（`fdab0000.npu`），用户态是 `librknnrt.so` 1.5.2
 
-NPU 推理要等一块 rk3588 的 `.rknn` 放进 `models/` 之后才能在设备上跑通。转换工具不在这个仓库里。rk3399pro 的模型不能 `rknn_init`。
+默认模型是 `weights/yolov5_rk3588_int8.rknn`：640 输入、1 个类别、三个 DFL 尺度。rk3399pro 的模型不能 `rknn_init`。

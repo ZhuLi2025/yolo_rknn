@@ -11,6 +11,12 @@
  * model_type=yolov3 走 decode_yolov3。darknet 的 YOLOv3 / YOLOv3-tiny：
  * 每个头通道数是 3 * (5 + nc)，框用 sigmoid 加网格、exp 乘 anchor。
  * Toolkit 1.x 常把 NCHW 的维度倒着填成 [W, H, C, N]，两种填法都认。
+ *
+ * model_type=yolov5 走 decode_yolov5，两种形态：
+ *  1. 本机 weights/yolov5_rk3588_int8.rknn：三个尺度，每个尺度一张 64 通道 DFL 框，
+ *     再加若干张 nc 通道分数图。同一尺度取输出顺序里最后一张分数图。
+ *  2. 经典 YOLOv5 锚点头：3 * (5 + nc)。框是 (sigmoid*2-0.5+grid)*stride，
+ *     宽高是 (sigmoid*2)^2 * anchor。
  */
 #pragma once
 
@@ -57,9 +63,14 @@ struct DecodeResult {
 
 DecodeResult decode_yolov8(const std::vector<RawTensor>& tensors, const DecodeParams& params);
 DecodeResult decode_yolov3(const std::vector<RawTensor>& tensors, const DecodeParams& params);
+DecodeResult decode_yolov5(const std::vector<RawTensor>& tensors, const DecodeParams& params);
 
-// 不看数值，只看 shape 能不能当成 yolov3 的检测头。初始化时用来尽早失败。
+// 不看数值，只看 shape 能不能当成对应检测头。初始化时用来尽早失败。
 bool yolov3_outputs_recognized(const std::vector<RawTensor>& tensors, int num_classes, int model_width,
+                               int model_height);
+bool yolov5_split_dfl_recognized(const std::vector<RawTensor>& tensors, int num_classes, int model_width,
+                                 int model_height);
+bool yolov5_outputs_recognized(const std::vector<RawTensor>& tensors, int num_classes, int model_width,
                                int model_height);
 
 }  // namespace yolo_rknn

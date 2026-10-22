@@ -104,7 +104,7 @@ Status assign(AppConfig* cfg, const std::string& key, const std::string& value, 
     } else if (key == "analyze_duration_us") {
         if (!parse_int(value, &cfg->analyze_duration_us)) return bad("expect int");
     } else if (key == "model_type") {
-        if (value != "yolov8" && value != "yolov3") return bad("expect yolov8 or yolov3");
+        if (value != "yolov8" && value != "yolov5" && value != "yolov3") return bad("expect yolov8, yolov5 or yolov3");
         cfg->model_type = value;
     } else if (key == "model_path") {
         cfg->model_path = value;
@@ -238,8 +238,8 @@ Status AppConfig::validate() const {
     if (max_delay_us < 0 || buffer_size < 4096 || stimeout_us < 0) {
         return Status::Fail("max_delay_us / buffer_size / stimeout_us out of range");
     }
-    if (model_type != "yolov8" && model_type != "yolov3") {
-        return Status::Fail("model_type must be yolov8 or yolov3");
+    if (model_type != "yolov8" && model_type != "yolov5" && model_type != "yolov3") {
+        return Status::Fail("model_type must be yolov8, yolov5 or yolov3");
     }
     if (npu_cores != "auto" && npu_cores != "0" && npu_cores != "1" && npu_cores != "2" && npu_cores != "0_1" &&
         npu_cores != "0_1_2") {
@@ -248,7 +248,7 @@ Status AppConfig::validate() const {
     if (!decode_only && model_path.empty()) {
         return Status::Fail("model_path is empty (or set decode_only=true)");
     }
-    if (model_type == "yolov3" && !anchors.empty() && (anchors.size() % 6) != 0) {
+    if ((model_type == "yolov3" || model_type == "yolov5") && !anchors.empty() && (anchors.size() % 6) != 0) {
         return Status::Fail("anchors must list 3 per head, each as width,height");
     }
     // RK3588 的 RGA3 要求宽高 16 对齐，RGB888 的字节跨度才能被硬件接受。

@@ -202,6 +202,53 @@ void test_yolov3_head() {
     }
 }
 
+void test_yolov5_split_dfl() {
+    constexpr int kGrid = 2;
+    std::vector<float> box(static_cast<std::size_t>(64 * kGrid * kGrid), -20.f);
+    std::vector<float> early(static_cast<std::size_t>(kGrid * kGrid), 0.99f);
+    std::vector<float> final_score(static_cast<std::size_t>(kGrid * kGrid), 0.f);
+    for (int side = 0; side < 4; ++side) {
+        box[static_cast<std::size_t>((side * 16 + 1) * kGrid * kGrid)] = 20.f;
+    }
+    final_score[0] = 0.95f;
+
+    auto grid = [&](std::vector<float>* storage, int channels) {
+        yolo_rknn::RawTensor tensor;
+        tensor.dims.push_back(1);
+        tensor.dims.push_back(channels);
+        tensor.dims.push_back(kGrid);
+        tensor.dims.push_back(kGrid);
+        tensor.channel_last = false;
+        tensor.data = storage->data();
+        tensor.n_elems = storage->size();
+        return tensor;
+    };
+    std::vector<yolo_rknn::RawTensor> tensors;
+    tensors.push_back(grid(&box, 64));
+    tensors.push_back(grid(&early, 1));
+    tensors.push_back(grid(&final_score, 1));
+
+    yolo_rknn::DecodeParams params;
+    params.num_classes = 1;
+    params.conf_threshold = 0.25f;
+    params.nms_threshold = 0.45f;
+    params.max_detections = 10;
+    params.dfl_scores_are_logits = false;
+    params.letterbox = identity_box(16);
+
+    expect(yolo_rknn::yolov5_split_dfl_recognized(tensors, 1, 16, 16), "split dfl shape");
+    const yolo_rknn::DecodeResult result = yolo_rknn::decode_yolov5(tensors, params);
+    expect(result.layout_recognized, "yolov5 split layout");
+    expect(result.detections.size() == 1, "one yolov5 box");
+    if (!result.detections.empty()) {
+        expect_near(result.detections[0].x, 0.f, 0.6f, "yolov5 x");
+        expect_near(result.detections[0].y, 0.f, 0.6f, "yolov5 y");
+        expect_near(result.detections[0].w, 12.f, 0.6f, "yolov5 w");
+        expect_near(result.detections[0].h, 12.f, 0.6f, "yolov5 h");
+        expect_near(result.detections[0].score, 0.95f, 1e-4f, "yolov5 uses the last score map");
+    }
+}
+
 void test_zoom() {
     yolo_rknn::ZoomInput in;
     in.has_target = false;
@@ -264,6 +311,7 @@ int main() {
     test_dfl();
     test_unknown_layout();
     test_yolov3_head();
+    test_yolov5_split_dfl();
     test_zoom();
     test_osd_stroke();
     if (g_failed != 0) {
