@@ -17,6 +17,9 @@ struct Detection {
     float h = 0.f;
     float score = 0.f;
     int class_id = -1;
+    // -1 未做头盔分类。0 有头盔，1 无头盔。不覆盖 class_id，变焦过滤仍看检测类别。
+    int helmet = -1;
+    float helmet_score = 0.f;
 };
 
 struct InferenceResult {

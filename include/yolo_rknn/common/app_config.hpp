@@ -47,6 +47,9 @@ struct AppConfig {
     bool anchor_scores_are_probabilities = true;
     bool dfl_scores_are_logits = true;
     bool decode_only = false;           // 只跑拉流+硬解+RGA，不加载 NPU 模型
+    // 每个检测框再跑一次二分类。关闭时 OSD 仍用检测类别名。
+    bool helmet_enable = false;
+    std::string helmet_model;
 
     // ---- 线程 ----
     int queue_depth = 2;
@@ -64,6 +67,11 @@ struct AppConfig {
     std::string display_device = "/dev/dri/card0";
     int display_cpu = 1;
     int display_priority = 15;
+
+    // ---- 录制 ----
+    // 原图叠上 OSD 后写成 H.264 MP4。不依赖 display_enable。
+    bool record_enable = false;
+    std::string record_dir = "recordings";
 
     // ---- 解码 ----
     bool low_latency_decode = true;

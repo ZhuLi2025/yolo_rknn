@@ -176,11 +176,20 @@ void osd_draw(OsdCanvas& canvas, const std::vector<Detection>& detections) {
         if (w < 2 || h < 2) {
             continue;
         }
-        const std::uint32_t color = box_color(det.class_id);
+        const bool helmet = det.helmet == 0 || det.helmet == 1;
+        const std::uint32_t helmet_color = det.helmet == 0 ? 0xFF00FF00u : 0xFFFF8000u;
+        const std::uint32_t color = helmet ? helmet_color : box_color(det.class_id);
         stroke_rect(canvas, x, y, w, h, kBorder, color);
 
         char label[64];
-        std::snprintf(label, sizeof(label), "%s %.0f%%", coco_name(det.class_id), det.score * 100.f);
+        std::uint32_t text_color = 0xFFFFFFFFu;
+        if (helmet) {
+            const char* name = det.helmet == 0 ? "helmet" : "no helmet";
+            std::snprintf(label, sizeof(label), "%s %.0f%%", name, det.helmet_score * 100.f);
+            text_color = helmet_color;
+        } else {
+            std::snprintf(label, sizeof(label), "%s %.0f%%", coco_name(det.class_id), det.score * 100.f);
+        }
         const int text_w = static_cast<int>(std::strlen(label)) * 8 * kScale;
         int tx = x;
         int ty = y - text_h - 2;
@@ -188,7 +197,7 @@ void osd_draw(OsdCanvas& canvas, const std::vector<Detection>& detections) {
             ty = y + kBorder;
         }
         fill_rect(canvas, tx, ty, text_w, text_h, 0xC0000000u);
-        draw_text(canvas, tx, ty, label, 0xFFFFFFFFu);
+        draw_text(canvas, tx, ty, label, text_color);
     }
 }
 

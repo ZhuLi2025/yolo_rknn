@@ -72,4 +72,7 @@ Testing/
 .cache/
 
 # test data
-testdata/   
+testdata/
+
+# 录制输出。app.conf 的 record_dir 默认就是这个目录。
+recordings/

@@ -1,10 +1,11 @@
 /**
  * @file pipeline.hpp
- * @brief 线程装配点。显示关闭时三条，打开时四条。线程之间只通过有界队列交换数据，不共享 MPP / RKNN context。
+ * @brief 线程装配点。显示和录制各自按配置加一条线程。线程之间只通过有界队列交换数据，不共享 MPP / RKNN context。
  *
  *   线程 stream    拉流 + VPU 硬解，产出 DecodedFrame（同时进推理队列和显示队列）
- *   线程 infer     RGA 预处理 + NPU 推理，产出 InferenceResult（同时进业务和 OSD）
+ *   线程 infer     RGA 预处理 + NPU 推理，产出 InferenceResult（同时进业务、OSD 和录制）
  *   线程 display   DRM 视频层扫 NV12，OSD 层画框
+ *   线程 record    原图叠上 OSD，VPU 编成 MP4
  *   线程 business  高度、变焦、相机指令
  */
 #pragma once
@@ -14,6 +15,7 @@
 #include "yolo_rknn/common/status.hpp"
 #include "yolo_rknn/decode/decoded_frame.hpp"
 #include "yolo_rknn/infer/detection.hpp"
+#include "yolo_rknn/record/mp4_recorder.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -44,6 +46,7 @@ private:
     void stream_main();
     void infer_main();
     void display_main();
+    void record_main();
     void business_main();
     void notify_ready();
     void notify_fail(const std::string& message);
@@ -56,10 +59,12 @@ private:
     BoundedQueue<DecodedFrame> display_frames_;
     BoundedQueue<InferenceResult> results_;
     BoundedQueue<InferenceResult> osd_results_;
+    BoundedQueue<RecordSample> record_samples_;
 
     std::thread stream_thread_;
     std::thread infer_thread_;
     std::thread display_thread_;
+    std::thread record_thread_;
     std::thread business_thread_;
 
     std::mutex life_mu_;

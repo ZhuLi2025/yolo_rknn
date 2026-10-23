@@ -5,8 +5,10 @@
 #include "yolo_rknn/common/thread_util.hpp"
 #include "yolo_rknn/decode/mpp_decoder.hpp"
 #include "yolo_rknn/display/drm_display.hpp"
+#include "yolo_rknn/infer/helmet_classifier.hpp"
 #include "yolo_rknn/infer/yolov8_detector.hpp"
 #include "yolo_rknn/preprocess/rga_preprocessor.hpp"
+#include "yolo_rknn/record/mp4_recorder.hpp"
 #include "yolo_rknn/stream/rtsp_client.hpp"
 
 #include <chrono>
@@ -40,7 +42,8 @@ Pipeline::Pipeline(AppConfig config)
       frames_(static_cast<std::size_t>(config_.queue_depth)),
       display_frames_(static_cast<std::size_t>(config_.queue_depth)),
       results_(static_cast<std::size_t>(config_.queue_depth)),
-      osd_results_(static_cast<std::size_t>(config_.queue_depth)) {}
+      osd_results_(static_cast<std::size_t>(config_.queue_depth)),
+      record_samples_(static_cast<std::size_t>(config_.queue_depth)) {}
 
 Pipeline::~Pipeline() { stop(); }
 
@@ -208,6 +211,15 @@ void Pipeline::infer_main() {
     } else {
         YR_LOGI("decode_only: RGA still runs, NPU is skipped");
     }
+    std::unique_ptr<HelmetClassifier> helmet;
+    if (!config_.decode_only && config_.helmet_enable) {
+        helmet.reset(new HelmetClassifier(config_));
+        st = helmet->init();
+        if (!st.ok()) {
+            notify_fail(st.message());
+            return;
+        }
+    }
     notify_ready();
 
     int64_t last_stat = steady_ms();
@@ -222,13 +234,12 @@ void Pipeline::infer_main() {
         PreprocessResult tiles[2];
         int ntiles = 2;
         st = pre.process(frame, tiles, &ntiles);
-        // RGA ioctl 返回后 NV12 不再被使用，立刻还回 VPU 的 buffer pool。
-        frame.retain.reset();
-        frame.fd = -1;
         const auto t1 = std::chrono::steady_clock::now();
         if (!st.ok()) {
             YR_LOGW("%s", st.message().c_str());
             pre.finish_cpu_read();
+            frame.retain.reset();
+            frame.fd = -1;
             continue;
         }
 
@@ -241,6 +252,25 @@ void Pipeline::infer_main() {
         if (detector) {
             st = detector->infer(tiles, ntiles, result);
         }
+        if (st.ok() && helmet) {
+            const auto c0 = std::chrono::steady_clock::now();
+            const Status hs = helmet->classify(frame, result.detections);
+            const auto c1 = std::chrono::steady_clock::now();
+            result.infer_ms += std::chrono::duration<double, std::milli>(c1 - c0).count();
+            if (!hs.ok()) {
+                YR_LOGW("%s", hs.message().c_str());
+            }
+        }
+        // 录制要读这块 NV12，先把引用交给录制队列，再还给 VPU。
+        if (st.ok() && config_.record_enable) {
+            RecordSample sample;
+            sample.frame = frame;
+            sample.result = result;
+            record_samples_.push(std::move(sample));
+        }
+        // 分类要读这块 NV12。RGA 返回之后再还给 VPU。
+        frame.retain.reset();
+        frame.fd = -1;
         pre.finish_cpu_read();
         if (detector && !st.ok()) {
             YR_LOGW("%s", st.message().c_str());
@@ -290,6 +320,32 @@ void Pipeline::display_main() {
     }
 }
 
+void Pipeline::record_main() {
+    apply_thread_attr(ThreadAttr{"yr_rec", 2, 10});
+    Mp4Recorder recorder(config_);
+    Status st = recorder.prepare();
+    if (!st.ok()) {
+        notify_fail(st.message());
+        return;
+    }
+    notify_ready();
+
+    while (true) {
+        RecordSample sample;
+        if (!record_samples_.pop(sample)) {
+            break;
+        }
+        st = recorder.write(sample);
+        if (!st.ok()) {
+            YR_LOGE("%s", st.message().c_str());
+            stop_.store(true);
+            break;
+        }
+    }
+    YR_LOGI("record thread exit frames=%llu dropped=%llu", static_cast<unsigned long long>(recorder.frames()),
+            static_cast<unsigned long long>(record_samples_.dropped()));
+}
+
 void Pipeline::business_main() {
     apply_thread_attr(ThreadAttr{"yr_biz", config_.business_cpu, config_.business_priority});
     Controller controller(config_);
@@ -306,11 +362,20 @@ void Pipeline::business_main() {
     }
 }
 
-int Pipeline::worker_count() const { return config_.display_enable ? 4 : 3; }
+int Pipeline::worker_count() const {
+    int count = 3;
+    if (config_.display_enable) {
+        ++count;
+    }
+    if (config_.record_enable) {
+        ++count;
+    }
+    return count;
+}
 
 Status Pipeline::start() {
     if (stream_thread_.joinable() || infer_thread_.joinable() || display_thread_.joinable() ||
-        business_thread_.joinable()) {
+        record_thread_.joinable() || business_thread_.joinable()) {
         return Status::Fail("pipeline already started");
     }
     stop_.store(false);
@@ -318,6 +383,9 @@ Status Pipeline::start() {
     infer_thread_ = std::thread(&Pipeline::infer_main, this);
     if (config_.display_enable) {
         display_thread_ = std::thread(&Pipeline::display_main, this);
+    }
+    if (config_.record_enable) {
+        record_thread_ = std::thread(&Pipeline::record_main, this);
     }
     business_thread_ = std::thread(&Pipeline::business_main, this);
 
@@ -351,7 +419,14 @@ void Pipeline::stop() {
     if (display_thread_.joinable()) {
         display_thread_.join();
     }
-    // 推理和显示都已经放开 NV12，再拆解码器。
+    // 推理已经不再往录制队列塞帧，排空后才能拆解码器。
+    record_samples_.close();
+    if (record_thread_.joinable()) {
+        record_thread_.join();
+    }
+    // 写失败时队列里可能还剩着帧。先丢掉，再拆解码器。
+    record_samples_.clear();
+    // 推理、显示和录制都已经放开 NV12，再拆解码器。
     frames_.clear();
     display_frames_.clear();
     {

@@ -1,6 +1,6 @@
 /**
  * @file rga_lock.hpp
- * @brief librga 3.02 只有一个设备节点，推理线程和显示线程不能同时 ioctl。
+ * @brief librga 只有一个设备节点，推理、显示和录制不能同时 ioctl。
  */
 #pragma once
 

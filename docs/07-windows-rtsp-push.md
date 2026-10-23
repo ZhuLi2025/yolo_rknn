@@ -24,6 +24,10 @@ ffmpeg -re -stream_loop -1 -i $video -an `
   -f rtsp -rtsp_transport tcp $url
 ```
 
+or
+```
+ffmpeg -re -stream_loop -1 -i 7-480p.mp4 -an -c:v libx264 -pix_fmt yuv420p -profile:v baseline -bf 0 -g 24 -keyint_min 24 -preset veryfast -tune zerolatency -x264-params scenecut=0:repeat-headers=1 -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/live
+```
 PowerShell 里行尾的 `` ` `` 只是换行续写，ffmpeg 收不到它。它必须是该行最后一个字符，后面不能有空格。停推流用 `Ctrl+C`。
 
 ## 输入

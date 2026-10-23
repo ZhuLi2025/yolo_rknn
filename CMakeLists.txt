@@ -54,8 +54,10 @@ set(YR_SOURCES
     src/preprocess/rga_lock.cpp
     src/display/osd_painter.cpp
     src/display/drm_display.cpp
+    src/record/mp4_recorder.cpp
     src/infer/postprocess.cpp
     src/infer/yolov8_detector.cpp
+    src/infer/helmet_classifier.cpp
     src/business/zoom_policy.cpp
     src/business/controller.cpp
     src/pipeline/pipeline.cpp

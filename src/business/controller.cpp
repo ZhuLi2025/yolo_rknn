@@ -223,9 +223,18 @@ void Controller::poll() {
     }
     last_log = now;
     if (best != nullptr) {
+        const char* top_name = coco_name(best->class_id);
+        float top_score = best->score;
+        if (best->helmet == 0) {
+            top_name = "helmet";
+            top_score = best->helmet_score;
+        } else if (best->helmet == 1) {
+            top_name = "no helmet";
+            top_score = best->helmet_score;
+        }
         YR_LOGI("seq=%llu det=%zu top=%s score=%.2f box=(%.0f,%.0f,%.0f,%.0f) ratio=%.2f height=%.2fm infer=%.1fms",
-                static_cast<unsigned long long>(latest_.seq), latest_.detections.size(), coco_name(best->class_id),
-                best->score, best->x, best->y, best->w, best->h, input.bbox_h_ratio, height, latest_.infer_ms);
+                static_cast<unsigned long long>(latest_.seq), latest_.detections.size(), top_name, top_score, best->x,
+                best->y, best->w, best->h, input.bbox_h_ratio, height, latest_.infer_ms);
     } else {
         YR_LOGI("seq=%llu det=0 height=%.2fm preprocess=%.1fms infer=%.1fms",
                 static_cast<unsigned long long>(latest_.seq), height, latest_.preprocess_ms, latest_.infer_ms);

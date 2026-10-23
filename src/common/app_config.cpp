@@ -137,6 +137,10 @@ Status assign(AppConfig* cfg, const std::string& key, const std::string& value, 
         if (!parse_bool(value, &cfg->dfl_scores_are_logits)) return bad("expect bool");
     } else if (key == "decode_only") {
         if (!parse_bool(value, &cfg->decode_only)) return bad("expect bool");
+    } else if (key == "helmet_enable") {
+        if (!parse_bool(value, &cfg->helmet_enable)) return bad("expect bool");
+    } else if (key == "helmet_model") {
+        cfg->helmet_model = value;
     } else if (key == "run_mode") {
         cfg->decode_only = (value == "decode_only");
         if (value != "decode_only" && value != "full") return bad("expect full or decode_only");
@@ -160,6 +164,10 @@ Status assign(AppConfig* cfg, const std::string& key, const std::string& value, 
         if (!parse_int(value, &cfg->display_cpu)) return bad("expect int");
     } else if (key == "display_priority") {
         if (!parse_int(value, &cfg->display_priority)) return bad("expect int");
+    } else if (key == "record_enable") {
+        if (!parse_bool(value, &cfg->record_enable)) return bad("expect bool");
+    } else if (key == "record_dir") {
+        cfg->record_dir = value;
     } else if (key == "business_priority") {
         if (!parse_int(value, &cfg->business_priority)) return bad("expect int");
     } else if (key == "low_latency_decode") {
@@ -253,6 +261,9 @@ Status AppConfig::validate() const {
     if (!decode_only && model_path.empty()) {
         return Status::Fail("model_path is empty (or set decode_only=true)");
     }
+    if (helmet_enable && !decode_only && helmet_model.empty()) {
+        return Status::Fail("helmet_model is empty (or set helmet_enable=false)");
+    }
     if ((model_type == "yolov3" || model_type == "yolov5") && !anchors.empty() && (anchors.size() % 6) != 0) {
         return Status::Fail("anchors must list 3 per head, each as width,height");
     }
@@ -272,6 +283,9 @@ Status AppConfig::validate() const {
     }
     if (display_enable && display_device.empty()) {
         return Status::Fail("display_device is empty");
+    }
+    if (record_enable && record_dir.empty()) {
+        return Status::Fail("record_dir is empty (or set record_enable=false)");
     }
     if (conf_threshold < 0.f || nms_threshold < 0.f || target_bbox_ratio <= 0.f) {
         return Status::Fail("threshold or target_bbox_ratio is invalid");

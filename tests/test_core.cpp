@@ -378,6 +378,23 @@ void test_osd_stroke() {
     };
     expect((argb(8, 8) >> 24) != 0, "box border is visible");
     expect(argb(28, 40) == 0, "box interior stays transparent");
+    expect(argb(8, 8) == 0xFF00FF00u, "default label keeps the class color");
+
+    std::memset(pixels.data(), 0, pixels.size());
+    det.helmet = 1;
+    det.helmet_score = 0.8f;
+    yolo_rknn::osd_draw(canvas, {det});
+    expect(argb(8, 8) == 0xFFFF8000u, "no helmet box is orange");
+    bool saw_orange_text = false;
+    for (int yy = 11; yy < 45 && !saw_orange_text; ++yy) {
+        for (int xx = 11; xx < 45; ++xx) {
+            if (argb(xx, yy) == 0xFFFF8000u) {
+                saw_orange_text = true;
+                break;
+            }
+        }
+    }
+    expect(saw_orange_text, "no helmet label is orange");
 }
 
 }  // namespace
